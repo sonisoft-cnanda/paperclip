@@ -47,6 +47,11 @@ Both live under the `auth` block of `config.json`:
 A provider needs `discoveryUrl`, or `issuer`, or both `authorizationUrl` and
 `tokenUrl`.
 
+**Per-provider setup recipes** — Microsoft Entra ID, Okta, Google Workspace,
+Auth0, Keycloak, and plain OAuth 2.0 — live in
+[AUTH-SSO-PROVIDERS.md](./AUTH-SSO-PROVIDERS.md), along with a troubleshooting
+table.
+
 ### Who can sign in via SSO
 
 By default (`disableSignUp: false`) **any account in the IdP's directory can
