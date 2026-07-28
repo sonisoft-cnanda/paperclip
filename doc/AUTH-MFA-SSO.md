@@ -35,7 +35,9 @@ Both live under the `auth` block of `config.json`:
         "discoveryUrl": "https://<org>.okta.com/.well-known/openid-configuration",
         "clientId": "<client-id>",
         "clientSecretEnv": "PAPERCLIP_SSO_OKTA_CLIENT_SECRET",
-        "scopes": ["openid", "email", "profile"]
+        "scopes": ["openid", "email", "profile"],
+        // Recommended for production. See "Who can sign in via SSO" below.
+        "disableSignUp": true
       }
     ]
   }
@@ -44,6 +46,26 @@ Both live under the `auth` block of `config.json`:
 
 A provider needs `discoveryUrl`, or `issuer`, or both `authorizationUrl` and
 `tokenUrl`.
+
+### Who can sign in via SSO
+
+By default (`disableSignUp: false`) **any account in the IdP's directory can
+authenticate**, and a matching Paperclip user is created on first login. Such a
+user has no instance role and no company membership, so they land on the
+no-access page — but the user row exists.
+
+Set `disableSignUp: true` per provider to require that the user already exists.
+Combined with company invites, this gives the intended posture: **pre-provision
+access, then let SSO attach to it by verified email.**
+
+Note this is *separate* from the top-level `auth.disableSignUp`, which only
+governs email/password registration and has no effect on SSO.
+
+Authentication and authorisation are distinct here: SSO only proves identity.
+Access comes from an instance role or a company membership, and memberships are
+granted through invites (`POST /api/companies/:companyId/invites`, accepted at
+`/invite/:token`). A user who signs in via SSO with no membership sees the
+no-access page until someone invites them.
 
 ### Environment overrides
 
@@ -76,10 +98,27 @@ forwards every plugin endpoint.
 ### Account linking
 
 `accountLinking` is enabled for configured SSO providers, so an OIDC login whose
-verified email matches an existing user **links to that user** rather than
-creating a duplicate. This matters beyond tidiness: board API keys resolve
-through their owning user row, so a JIT-created duplicate would orphan an
-operator's existing keys.
+email matches an existing user **links to that user** rather than creating a
+duplicate. This matters beyond tidiness: board API keys, company memberships and
+instance roles all resolve through the owning user row, so a JIT-created
+duplicate would orphan an operator's existing access.
+
+**`requireLocalEmailVerified: false` is required, not optional.** BetterAuth
+defaults it to `true`, which demands the *local* user already be email-verified.
+Paperclip sets `requireEmailVerification: false` and has no verification flow, so
+`user.emailVerified` is always `false` — leaving the default in place makes
+linking impossible and every SSO login for an existing address fails with
+`account_not_linked`.
+
+> **Security precondition.** Because unverified local accounts are linkable, an
+> instance that allows open self-registration lets someone pre-register a
+> colleague's address and capture their first SSO sign-in. On any instance where
+> users do not already control their own email addresses, set **both**:
+>
+> - `auth.disableSignUp: true` — no open password registration
+> - `auth.sso.providers[].disableSignUp: true` — no JIT-created SSO users
+>
+> and provision access through company invites instead.
 
 ## Database
 

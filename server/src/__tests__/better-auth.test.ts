@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 import type { BetterAuthOptions } from "better-auth";
+import { authSsoProviderConfigSchema } from "@paperclipai/shared";
 import { getCookies } from "better-auth/cookies";
 import {
   buildBetterAuthAdvancedOptions,
@@ -262,6 +263,31 @@ describe("SSO provider resolution", () => {
 
     expect(configs).toEqual([]);
     expect(skipped).toEqual(["okta"]);
+  });
+
+  it("defaults disableSignUp to false so SSO keeps working out of the box", () => {
+    // The default lives in the schema, so assert it there rather than against a
+    // hand-built fixture that would never exercise it.
+    const parsed = authSsoProviderConfigSchema.parse({
+      providerId: "okta",
+      clientId: "client-id",
+      clientSecretEnv: "PAPERCLIP_SSO_OKTA_CLIENT_SECRET",
+      discoveryUrl: "https://example.okta.com/.well-known/openid-configuration",
+    });
+
+    expect(parsed.disableSignUp).toBe(false);
+  });
+
+  it("passes disableSignUp through so SSO can be limited to pre-provisioned users", () => {
+    const config = configWith({
+      authSsoProviders: [{ ...provider, disableSignUp: true }],
+    });
+
+    const { configs } = buildSsoProviderConfigs(config, {
+      PAPERCLIP_SSO_OKTA_CLIENT_SECRET: "s3cret",
+    } as NodeJS.ProcessEnv);
+
+    expect(configs[0]).toMatchObject({ disableSignUp: true });
   });
 
   it("resolves nothing when SSO is disabled", () => {

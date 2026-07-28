@@ -77,6 +77,12 @@ export const authSsoProviderConfigSchema = z.object({
   clientSecretEnv: z.string().min(1),
   scopes: z.array(z.string().min(1)).default(["openid", "email", "profile"]),
   displayName: z.string().min(1).optional(),
+  // When true, an SSO login only succeeds for a user that already exists —
+  // typically one pre-provisioned via a company invite. Without this, anyone in
+  // the IdP's directory can authenticate and be created as a Paperclip user
+  // (they land with no company access, but the row exists). Note this is
+  // separate from `auth.disableSignUp`, which only governs email/password.
+  disableSignUp: z.boolean().default(false),
 }).refine(
   (value) => Boolean(value.discoveryUrl ?? value.issuer ?? (value.authorizationUrl && value.tokenUrl)),
   { message: "Provide discoveryUrl, issuer, or both authorizationUrl and tokenUrl" },

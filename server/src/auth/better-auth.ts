@@ -184,6 +184,9 @@ export function buildSsoProviderConfigs(
       clientId: provider.clientId,
       clientSecret,
       scopes: provider.scopes,
+      // Per-provider: `auth.disableSignUp` only covers emailAndPassword, so
+      // without this an SSO login JIT-creates users regardless of that setting.
+      disableSignUp: provider.disableSignUp,
       ...(provider.discoveryUrl ? { discoveryUrl: provider.discoveryUrl } : {}),
       ...(provider.issuer ? { issuer: provider.issuer } : {}),
       ...(provider.authorizationUrl ? { authorizationUrl: provider.authorizationUrl } : {}),
@@ -259,14 +262,29 @@ export function createBetterAuthInstance(db: Db, config: Config, trustedOrigins:
       },
     }),
     plugins,
-    // An OIDC sign-in whose verified email matches an existing user links to
-    // that user instead of creating a duplicate. This also keeps board API keys
-    // working across an SSO rollout: they resolve through the owning user row,
-    // which must survive rather than be replaced by a JIT-created account.
+    // An OIDC sign-in whose email matches an existing user links to that user
+    // instead of creating a duplicate. This keeps board API keys working across
+    // an SSO rollout: they resolve through the owning user row, which must
+    // survive rather than be replaced by a JIT-created account.
     account: {
       accountLinking: {
         enabled: ssoProviderConfigs.length > 0,
         trustedProviders: ssoProviderConfigs.map((entry) => entry.providerId as string),
+        // Required, not optional. BetterAuth defaults this to true, which
+        // demands the *local* user already be email-verified — but Paperclip
+        // sets `requireEmailVerification: false` below and has no verification
+        // flow, so `user.emailVerified` is always false. Left at the default,
+        // linking can never succeed and every SSO login for an existing email
+        // fails with `account_not_linked`.
+        //
+        // Security precondition: this makes an unverified local account
+        // linkable by a trusted IdP identity with the same address. That is
+        // only safe when local account creation is controlled — keep
+        // `auth.disableSignUp: true` (and provision via invites) on any
+        // instance where users do not already own their email addresses.
+        // Otherwise someone could pre-register a colleague's address and
+        // capture their first SSO sign-in.
+        requireLocalEmailVerified: false,
       },
     },
     emailAndPassword: {
