@@ -101,18 +101,95 @@ A misconfigured provider can never stop the instance from booting.
 
 ## Microsoft Entra ID
 
-> Verified end to end against a live tenant.
+> Verified end to end against a live tenant: registration, consent, callback,
+> token exchange, session creation and account linking.
 
-1. **Entra admin center → Identity → Applications → App registrations → New registration**
-   - Supported account types: *Accounts in this organizational directory only*
-   - Redirect URI: platform **Web** →
-     `https://<publicBaseUrl>/api/auth/oauth2/callback/entra`
-2. **Certificates & secrets → New client secret.** Copy the *Value* (not the Secret ID) — shown once.
-3. **Token configuration → Add optional claim → ID → `email`.** ⚠️ **Do not skip.**
-   Entra omits `email` from the ID token by default, and a login with no email is
-   rejected with `email_is_missing`. The account must also have a real mail
-   attribute populated.
-4. Copy the **Directory (tenant) ID** and **Application (client) ID** from Overview.
+### Use App registrations, not Enterprise applications
+
+This is the single most common wrong turn. In Entra:
+
+- **App registrations** is where **OIDC / OAuth 2.0** apps are configured. This is
+  what Paperclip needs.
+- **Enterprise applications → Single sign-on** offers only **SAML**,
+  password-based and linked sign-on. There is no OIDC option there, and Paperclip
+  does not support SAML.
+
+Registering the app automatically creates a matching Enterprise application
+(the service principal). You go back to it later only to restrict *who* may sign
+in — see [Restricting who can sign in](#restricting-who-can-sign-in-recommended).
+
+### 1. Register the application
+
+Requires at least the **Application Developer** role.
+
+1. Sign in to the [Microsoft Entra admin center](https://entra.microsoft.com).
+2. If you belong to several tenants, use the **Settings** icon in the top bar to
+   switch to the right one.
+3. Browse to **Entra ID** → **App registrations** → **New registration**.
+4. **Name**: anything meaningful, e.g. `Paperclip`. Users can see it, and it can
+   be changed later.
+5. **Supported account types** — pick **Single tenant only – &lt;your tenant&gt;**
+   unless you have a specific reason not to:
+
+   | Option | Use when |
+   | --- | --- |
+   | **Single tenant only – &lt;your tenant&gt;** | Normal case. Only users and guests in your directory. |
+   | **Multiple Entra ID tenants** | A multi-org SaaS deployment. |
+   | **Any Entra ID Tenant + Personal Microsoft accounts** | Also allows Xbox/Live/Hotmail accounts. |
+   | **Personal accounts only** | Consumer accounts only. |
+
+6. **Redirect URI**: choose platform **Web**, then enter, substituting your
+   `providerId`:
+
+   ```
+   https://<publicBaseUrl>/api/auth/oauth2/callback/entra
+   ```
+
+7. Select **Register**.
+
+### 2. Add a client secret
+
+1. On the app, go to **Manage** → **Certificates & secrets** → **Client secrets**
+   → **New client secret**.
+2. Add a description and choose an expiry (or a custom lifetime).
+3. Select **Add**, then immediately copy the **Value** column.
+
+> Copy the **Value**, not the **Secret ID**. The Value is displayed only once —
+> navigate away and it is unrecoverable and you must create a new secret.
+>
+> Secrets expire. Note the expiry date; Paperclip will start rejecting SSO logins
+> when it lapses, and a rotated secret only needs the env var updated and the
+> process restarted — no config change.
+
+### 3. Add the `email` optional claim — required
+
+Requires at least the **Cloud Application Administrator** role.
+
+1. On the app, go to **Manage** → **Token configuration**.
+2. Select **Add optional claim**.
+3. Choose token type **ID**.
+4. Tick **email**, then select **Add**.
+5. If the portal offers to turn on the related Microsoft Graph permission, accept.
+
+**Why this is mandatory.** Entra keeps tokens small and omits `email` by default.
+BetterAuth reads the ID token and only accepts it when both `sub` and `email` are
+present, otherwise falling back to the userinfo endpoint; with no email anywhere,
+the callback aborts and Paperclip logs `email_is_missing`. Paperclip identifies
+and links users by email address, so there is no way around this.
+
+> Even with the claim added, Entra emits it only when the account actually has a
+> mail attribute populated. Accounts with no mailbox — some service or admin
+> accounts, and some guest accounts — can still arrive without an email. Test
+> with a normal user who has a real mailbox.
+
+### 4. Collect the identifiers
+
+From the app's **Overview** page:
+
+- **Directory (tenant) ID** → goes into the discovery URL
+- **Application (client) ID** → `clientId`
+
+### 5. Configure Paperclip
 
 ```jsonc
 {
@@ -127,11 +204,72 @@ A misconfigured provider can never stop the instance from booting.
 }
 ```
 
-**Local testing:** Entra requires HTTPS for Web redirect URIs, with
-`http://localhost` as the only documented exception — `http://127.0.0.1` is
-**not** accepted. Use `localhost` consistently: the OAuth state cookie is scoped
-to the host that started the flow, and browsers treat `localhost` and `127.0.0.1`
-as different hosts, so mixing them breaks the callback.
+Set the secret in the environment, not in config:
+
+```bash
+PAPERCLIP_SSO_ENTRA_CLIENT_SECRET='<the Value you copied>'
+```
+
+Restart, then confirm the provider actually registered:
+
+```bash
+curl -s https://<publicBaseUrl>/api/auth/config
+# {"twoFactor":{...},"sso":{"providers":[{"providerId":"entra","displayName":"Microsoft"}]}}
+```
+
+An empty `providers` array means the secret env var was unset, so the provider
+was skipped — check the startup log for the warning naming it.
+
+### Restricting who can sign in (recommended)
+
+By default **anyone in your directory** can authenticate. Two independent
+controls, best used together:
+
+**Entra side** — restrict at the IdP, so unassigned users never even reach
+Paperclip:
+
+1. **Entra ID** → **Enterprise apps** → select your app.
+2. **Manage** → **Properties** → set **Assignment required?** to **Yes**, Save.
+3. **Manage** → **Users and groups** → **Add user/group** — assign a security
+   group rather than individuals where you can.
+
+> ⚠️ **Global Administrators are exempt from assignment restrictions by design.**
+> If you are testing with a Global Admin account it will sign in regardless of
+> the setting, which looks like the restriction is broken. Test with a standard
+> user.
+
+**Paperclip side** — `"disableSignUp": true` on the provider, so an SSO login only
+succeeds for a user that already exists. Keep this on regardless: it is the
+authoritative control, and it is what makes
+[account linking](./AUTH-MFA-SSO.md#account-linking) safe.
+
+### Local testing
+
+Entra requires HTTPS for Web redirect URIs, with **`http://localhost` as the only
+documented exception** — `http://127.0.0.1` is **not** accepted for the Web
+platform.
+
+Use `localhost` consistently for the whole flow. The OAuth state cookie is scoped
+to the host that started it, and browsers treat `localhost` and `127.0.0.1` as
+different hosts, so starting on one and finishing on the other fails the callback
+with a state error. Set `auth.publicBaseUrl` to `http://localhost:<port>` and
+include `localhost` in `server.allowedHostnames`.
+
+Redirect URIs are **case-sensitive** and must match exactly. Avoid registering
+several localhost URIs that differ only by port — Entra picks one arbitrarily;
+differentiate by path instead.
+
+### Entra troubleshooting
+
+| Symptom | Cause |
+| --- | --- |
+| `email_is_missing` | The `email` optional claim is missing, or the account has no mail attribute. |
+| `AADSTS50011` redirect mismatch | The registered redirect URI does not match exactly — check scheme, port, case and the `providerId` segment. |
+| `AADSTS7000215` invalid client secret | Wrong value (Secret ID instead of Value), or the secret expired. |
+| `AADSTS50105` user not assigned | **Assignment required?** is on and the user is not assigned. Expected — assign them. |
+| Restriction seems ignored | You are testing as a Global Administrator, who bypasses assignment by design. |
+| Only SAML options are offered | You are in **Enterprise applications → Single sign-on**. OIDC lives in **App registrations**. |
+| App missing from users' My Apps | New registrations are hidden by default. **Enterprise apps** → app → **Properties** → **Visible to users?** → **Yes**. |
 
 ## Okta
 
