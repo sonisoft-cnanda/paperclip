@@ -25,6 +25,9 @@ function NoBoardAccessPage() {
   );
 }
 
+/** Where un-enrolled users are sent when `auth.twoFactor.enforcement` is "required". */
+const PROFILE_SETTINGS_PATH = "/company/settings/instance/profile";
+
 export function CloudAccessGate() {
   const location = useLocation();
   const queryClient = useQueryClient();
@@ -50,6 +53,14 @@ export function CloudAccessGate() {
     queryFn: () => authApi.getSession(),
     enabled: isAuthenticatedMode,
     retry: false,
+  });
+
+  const authConfigQuery = useQuery({
+    queryKey: queryKeys.auth.config,
+    queryFn: () => authApi.getAuthConfig(),
+    enabled: isAuthenticatedMode,
+    retry: false,
+    staleTime: 5 * 60_000,
   });
 
   const boardAccessQuery = useQuery({
@@ -114,6 +125,23 @@ export function CloudAccessGate() {
   if (isAuthenticatedMode && !sessionQuery.data) {
     const next = encodeURIComponent(`${location.pathname}${location.search}`);
     return <Navigate to={`/auth?next=${next}`} replace />;
+  }
+
+  // Enrollment gate for `enforcement: "required"`. This is deliberately *after*
+  // the unauthenticated check: a signed-in but un-enrolled user has a truthy
+  // session, so the check above would never catch them. There is no
+  // corresponding "2FA pending" case — BetterAuth deletes the credential
+  // session while a challenge is in flight, so such a user is simply
+  // unauthenticated and redirected above.
+  if (
+    isAuthenticatedMode &&
+    sessionQuery.data &&
+    authConfigQuery.data?.twoFactor.enabled &&
+    authConfigQuery.data.twoFactor.enforcement === "required" &&
+    !sessionQuery.data.user.twoFactorEnabled &&
+    location.pathname !== PROFILE_SETTINGS_PATH
+  ) {
+    return <Navigate to={PROFILE_SETTINGS_PATH} replace />;
   }
 
   if (

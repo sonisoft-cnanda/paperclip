@@ -7,6 +7,7 @@ import { resolvePaperclipEnvPath } from "./paths.js";
 import { maybeRepairLegacyWorktreeConfigAndEnvFiles } from "./worktree-config.js";
 import {
   AUTH_BASE_URL_MODES,
+  AUTH_TWO_FACTOR_ENFORCEMENTS,
   BIND_MODES,
   DEPLOYMENT_EXPOSURES,
   DEPLOYMENT_MODES,
@@ -14,6 +15,8 @@ import {
   STORAGE_PROVIDERS,
   type BindMode,
   type AuthBaseUrlMode,
+  type AuthSsoProviderConfig,
+  type AuthTwoFactorEnforcement,
   type DeploymentExposure,
   type DeploymentMode,
   type SecretProvider,
@@ -60,6 +63,10 @@ export interface Config {
   authBaseUrlMode: AuthBaseUrlMode;
   authPublicBaseUrl: string | undefined;
   authDisableSignUp: boolean;
+  authTwoFactorEnabled: boolean;
+  authTwoFactorEnforcement: AuthTwoFactorEnforcement;
+  authSsoEnabled: boolean;
+  authSsoProviders: AuthSsoProviderConfig[];
   databaseMode: DatabaseMode;
   databaseUrl: string | undefined;
   databaseMigrationUrl: string | undefined;
@@ -213,6 +220,25 @@ export function loadConfig(): Config {
     disableSignUpFromEnv !== undefined
       ? disableSignUpFromEnv === "true"
       : (fileConfig?.auth?.disableSignUp ?? false);
+  const twoFactorEnabledFromEnv = process.env.PAPERCLIP_AUTH_TWO_FACTOR_ENABLED;
+  const authTwoFactorEnabled: boolean =
+    twoFactorEnabledFromEnv !== undefined
+      ? twoFactorEnabledFromEnv === "true"
+      : (fileConfig?.auth?.twoFactor?.enabled ?? false);
+  const twoFactorEnforcementFromEnvRaw = process.env.PAPERCLIP_AUTH_TWO_FACTOR_ENFORCEMENT;
+  const twoFactorEnforcementFromEnv =
+    twoFactorEnforcementFromEnvRaw &&
+    AUTH_TWO_FACTOR_ENFORCEMENTS.includes(twoFactorEnforcementFromEnvRaw as AuthTwoFactorEnforcement)
+      ? (twoFactorEnforcementFromEnvRaw as AuthTwoFactorEnforcement)
+      : null;
+  const authTwoFactorEnforcement: AuthTwoFactorEnforcement =
+    twoFactorEnforcementFromEnv ?? fileConfig?.auth?.twoFactor?.enforcement ?? "optional";
+  const ssoEnabledFromEnv = process.env.PAPERCLIP_AUTH_SSO_ENABLED;
+  const authSsoProviders: AuthSsoProviderConfig[] = fileConfig?.auth?.sso?.providers ?? [];
+  const authSsoEnabled: boolean =
+    (ssoEnabledFromEnv !== undefined
+      ? ssoEnabledFromEnv === "true"
+      : (fileConfig?.auth?.sso?.enabled ?? false)) && authSsoProviders.length > 0;
   const allowedHostnamesFromEnvRaw = process.env.PAPERCLIP_ALLOWED_HOSTNAMES;
   const allowedHostnamesFromEnv = allowedHostnamesFromEnvRaw
     ? allowedHostnamesFromEnvRaw
@@ -296,6 +322,10 @@ export function loadConfig(): Config {
     authBaseUrlMode,
     authPublicBaseUrl,
     authDisableSignUp,
+    authTwoFactorEnabled,
+    authTwoFactorEnforcement,
+    authSsoEnabled,
+    authSsoProviders,
     databaseMode: fileDatabaseMode,
     databaseUrl: process.env.DATABASE_URL ?? fileDbUrl,
     databaseMigrationUrl: process.env.DATABASE_MIGRATION_URL,

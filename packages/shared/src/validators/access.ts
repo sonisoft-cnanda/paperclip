@@ -1,6 +1,7 @@
 import { z } from "zod";
 import {
   AGENT_ADAPTER_TYPES,
+  AUTH_TWO_FACTOR_ENFORCEMENTS,
   HUMAN_COMPANY_MEMBERSHIP_ROLES,
   INVITE_JOIN_TYPES,
   JOIN_REQUEST_STATUSES,
@@ -188,6 +189,11 @@ export const currentUserProfileSchema = z.object({
     z.string().min(1).max(120).nullable(),
   ),
   image: profileImageSchema.nullable(),
+  // Defaulted rather than required so an older client/server pairing still parses.
+  // There is deliberately no `twoFactorPending` flag: BetterAuth deletes the
+  // credential session while a 2FA challenge is in flight, so a pending session
+  // never resolves here at all (see server/src/auth/better-auth.ts).
+  twoFactorEnabled: z.boolean().default(false),
 });
 
 export type CurrentUserProfile = z.infer<typeof currentUserProfileSchema>;
@@ -199,6 +205,26 @@ export const authSessionSchema = z.object({
   }),
   user: currentUserProfileSchema,
 });
+
+/**
+ * Auth capabilities the sign-in page needs before anyone is authenticated.
+ * Contains no secrets — only which flows are switched on and which SSO
+ * providers actually resolved a client secret at boot.
+ */
+export const authClientConfigSchema = z.object({
+  twoFactor: z.object({
+    enabled: z.boolean(),
+    enforcement: z.enum(AUTH_TWO_FACTOR_ENFORCEMENTS),
+  }),
+  sso: z.object({
+    providers: z.array(z.object({
+      providerId: z.string().min(1),
+      displayName: z.string().min(1),
+    })),
+  }),
+});
+
+export type AuthClientConfig = z.infer<typeof authClientConfigSchema>;
 
 export type AuthSession = z.infer<typeof authSessionSchema>;
 

@@ -16,6 +16,9 @@ export type BindMode = (typeof BIND_MODES)[number];
 export const AUTH_BASE_URL_MODES = ["auto", "explicit"] as const;
 export type AuthBaseUrlMode = (typeof AUTH_BASE_URL_MODES)[number];
 
+export const AUTH_TWO_FACTOR_ENFORCEMENTS = ["optional", "required"] as const;
+export type AuthTwoFactorEnforcement = (typeof AUTH_TWO_FACTOR_ENFORCEMENTS)[number];
+
 export const AGENT_STATUSES = [
   "active",
   "paused",

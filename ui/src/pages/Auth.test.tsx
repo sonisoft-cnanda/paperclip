@@ -11,14 +11,31 @@ import { AuthPage } from "./Auth";
 const getSessionMock = vi.hoisted(() => vi.fn());
 const signInEmailMock = vi.hoisted(() => vi.fn());
 const signUpEmailMock = vi.hoisted(() => vi.fn());
+const getAuthConfigMock = vi.hoisted(() => vi.fn());
+const verifyTotpMock = vi.hoisted(() => vi.fn());
+const verifyBackupCodeMock = vi.hoisted(() => vi.fn());
+const signInSsoMock = vi.hoisted(() => vi.fn());
 
+// vi.mock replaces the whole module, so every authApi member the page touches
+// must appear here or it resolves to undefined at call time.
 vi.mock("../api/auth", () => ({
   authApi: {
     getSession: () => getSessionMock(),
     signInEmail: (input: unknown) => signInEmailMock(input),
     signUpEmail: (input: unknown) => signUpEmailMock(input),
+    getAuthConfig: () => getAuthConfigMock(),
+    signInSso: (providerId: string) => signInSsoMock(providerId),
+    twoFactor: {
+      verifyTotp: (input: unknown) => verifyTotpMock(input),
+      verifyBackupCode: (input: unknown) => verifyBackupCodeMock(input),
+    },
   },
 }));
+
+const NO_AUTH_EXTRAS = {
+  twoFactor: { enabled: false, enforcement: "optional" as const },
+  sso: { providers: [] },
+};
 
 // The ASCII art animation drives a canvas/requestAnimationFrame loop that adds
 // nothing to these assertions, so stub it out.
@@ -86,8 +103,12 @@ describe("AuthPage", () => {
     container = document.createElement("div");
     document.body.appendChild(container);
     getSessionMock.mockResolvedValue(null);
-    signInEmailMock.mockResolvedValue(undefined);
+    signInEmailMock.mockResolvedValue({ status: "signed_in" });
     signUpEmailMock.mockResolvedValue(undefined);
+    getAuthConfigMock.mockResolvedValue(NO_AUTH_EXTRAS);
+    verifyTotpMock.mockResolvedValue(undefined);
+    verifyBackupCodeMock.mockResolvedValue(undefined);
+    signInSsoMock.mockResolvedValue("https://idp.example.test/authorize");
   });
 
   afterEach(() => {
@@ -248,6 +269,168 @@ describe("AuthPage", () => {
       password: "supersecret",
     });
     expect(queryClient.getQueryState(queryKeys.health)?.isInvalidated).toBe(true);
+
+    await act(async () => {
+      root.unmount();
+    });
+  });
+
+  async function submitCredentials() {
+    const inputValueSetter = Object.getOwnPropertyDescriptor(
+      HTMLInputElement.prototype,
+      "value",
+    )?.set;
+    const emailInput = container.querySelector('input[name="email"]') as HTMLInputElement;
+    const passwordInput = container.querySelector('input[name="password"]') as HTMLInputElement;
+
+    await act(async () => {
+      inputValueSetter!.call(emailInput, "jane@example.com");
+      emailInput.dispatchEvent(new Event("input", { bubbles: true }));
+      inputValueSetter!.call(passwordInput, "supersecret");
+      passwordInput.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+
+    const form = container.querySelector("form") as HTMLFormElement;
+    await act(async () => {
+      form.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+    });
+    await flushReact();
+    await flushReact();
+  }
+
+  it("shows the TOTP step instead of navigating when a second factor is required", async () => {
+    signInEmailMock.mockResolvedValue({ status: "two_factor_required", methods: ["totp"] });
+    const { root, queryClient } = await mount();
+
+    await submitCredentials();
+
+    // The code field replaces the credential fields.
+    expect(container.querySelector('input[name="code"]')).not.toBeNull();
+    expect(container.querySelector('input[name="email"]')).toBeNull();
+    expect(container.querySelector('input[name="password"]')).toBeNull();
+    // A pending challenge is not a sign-in, so nothing may be invalidated yet.
+    expect(queryClient.getQueryState(queryKeys.auth.session)?.isInvalidated).toBeFalsy();
+
+    await act(async () => {
+      root.unmount();
+    });
+  });
+
+  it("verifies the TOTP code and then completes sign-in", async () => {
+    signInEmailMock.mockResolvedValue({ status: "two_factor_required", methods: ["totp"] });
+    const { root, queryClient } = await mount();
+    queryClient.setQueryData(queryKeys.health, { status: "ok", deploymentMode: "authenticated" });
+
+    await submitCredentials();
+
+    const inputValueSetter = Object.getOwnPropertyDescriptor(
+      HTMLInputElement.prototype,
+      "value",
+    )?.set;
+    const codeInput = container.querySelector('input[name="code"]') as HTMLInputElement;
+    await act(async () => {
+      inputValueSetter!.call(codeInput, "123456");
+      codeInput.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+
+    const form = container.querySelector("form") as HTMLFormElement;
+    await act(async () => {
+      form.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+    });
+    await flushReact();
+    await flushReact();
+
+    expect(verifyTotpMock).toHaveBeenCalledWith({ code: "123456" });
+    expect(queryClient.getQueryState(queryKeys.health)?.isInvalidated).toBe(true);
+
+    await act(async () => {
+      root.unmount();
+    });
+  });
+
+  it("submits a backup code to the backup-code endpoint instead of verify-totp", async () => {
+    signInEmailMock.mockResolvedValue({ status: "two_factor_required", methods: ["totp"] });
+    const { root } = await mount();
+
+    await submitCredentials();
+
+    const toggle = Array.from(container.querySelectorAll("button")).find(
+      (button) => button.textContent?.includes("Use a backup code instead"),
+    ) as HTMLButtonElement;
+    await act(async () => {
+      toggle.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await flushReact();
+
+    const inputValueSetter = Object.getOwnPropertyDescriptor(
+      HTMLInputElement.prototype,
+      "value",
+    )?.set;
+    const codeInput = container.querySelector('input[name="code"]') as HTMLInputElement;
+    await act(async () => {
+      inputValueSetter!.call(codeInput, "backup-code-1");
+      codeInput.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+
+    const form = container.querySelector("form") as HTMLFormElement;
+    await act(async () => {
+      form.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+    });
+    await flushReact();
+    await flushReact();
+
+    expect(verifyBackupCodeMock).toHaveBeenCalledWith({ code: "backup-code-1" });
+    expect(verifyTotpMock).not.toHaveBeenCalled();
+
+    await act(async () => {
+      root.unmount();
+    });
+  });
+
+  it("renders an SSO button per configured provider and starts the redirect", async () => {
+    getAuthConfigMock.mockResolvedValue({
+      twoFactor: { enabled: false, enforcement: "optional" },
+      sso: { providers: [{ providerId: "okta", displayName: "Okta" }] },
+    });
+    const assign = vi.fn();
+    const originalLocation = window.location;
+    Object.defineProperty(window, "location", {
+      configurable: true,
+      value: { ...originalLocation, assign, origin: "https://board.example.test" },
+    });
+
+    try {
+      const { root } = await mount();
+
+      const ssoButton = Array.from(container.querySelectorAll("button")).find(
+        (button) => button.textContent?.includes("Sign in with Okta"),
+      ) as HTMLButtonElement;
+      expect(ssoButton).toBeDefined();
+
+      await act(async () => {
+        ssoButton.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      });
+      await flushReact();
+      await flushReact();
+
+      expect(signInSsoMock).toHaveBeenCalledWith("okta");
+      expect(assign).toHaveBeenCalledWith("https://idp.example.test/authorize");
+
+      await act(async () => {
+        root.unmount();
+      });
+    } finally {
+      Object.defineProperty(window, "location", { configurable: true, value: originalLocation });
+    }
+  });
+
+  it("does not render SSO buttons when no providers are configured", async () => {
+    const { root } = await mount();
+
+    const ssoButton = Array.from(container.querySelectorAll("button")).find(
+      (button) => button.textContent?.includes("Sign in with"),
+    );
+    expect(ssoButton).toBeUndefined();
 
     await act(async () => {
       root.unmount();

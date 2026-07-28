@@ -1,6 +1,7 @@
 import { z } from "zod";
 import {
   AUTH_BASE_URL_MODES,
+  AUTH_TWO_FACTOR_ENFORCEMENTS,
   BIND_MODES,
   DEPLOYMENT_EXPOSURES,
   DEPLOYMENT_MODES,
@@ -56,10 +57,42 @@ export const serverConfigSchema = z.object({
   serveUi: z.boolean().default(true),
 });
 
+export const authTwoFactorConfigSchema = z.object({
+  enabled: z.boolean().default(false),
+  // "optional": users opt in from profile settings.
+  // "required": enrolled users are challenged and un-enrolled users are pushed to enrollment.
+  enforcement: z.enum(AUTH_TWO_FACTOR_ENFORCEMENTS).default("optional"),
+});
+
+export const authSsoProviderConfigSchema = z.object({
+  providerId: z.string().min(1),
+  discoveryUrl: z.string().url().optional(),
+  issuer: z.string().url().optional(),
+  authorizationUrl: z.string().url().optional(),
+  tokenUrl: z.string().url().optional(),
+  userInfoUrl: z.string().url().optional(),
+  clientId: z.string().min(1),
+  // Name of the process.env var holding the client secret. The secret itself is
+  // never stored in config.json — see server/src/auth/better-auth.ts.
+  clientSecretEnv: z.string().min(1),
+  scopes: z.array(z.string().min(1)).default(["openid", "email", "profile"]),
+  displayName: z.string().min(1).optional(),
+}).refine(
+  (value) => Boolean(value.discoveryUrl ?? value.issuer ?? (value.authorizationUrl && value.tokenUrl)),
+  { message: "Provide discoveryUrl, issuer, or both authorizationUrl and tokenUrl" },
+);
+
+export const authSsoConfigSchema = z.object({
+  enabled: z.boolean().default(false),
+  providers: z.array(authSsoProviderConfigSchema).default([]),
+});
+
 export const authConfigSchema = z.object({
   baseUrlMode: z.enum(AUTH_BASE_URL_MODES).default("auto"),
   publicBaseUrl: z.string().url().optional(),
   disableSignUp: z.boolean().default(false),
+  twoFactor: authTwoFactorConfigSchema.default({ enabled: false, enforcement: "optional" }),
+  sso: authSsoConfigSchema.default({ enabled: false, providers: [] }),
 });
 
 export const storageLocalDiskConfigSchema = z.object({
@@ -194,6 +227,9 @@ export type StorageS3Config = z.infer<typeof storageS3ConfigSchema>;
 export type SecretsConfig = z.infer<typeof secretsConfigSchema>;
 export type SecretsLocalEncryptedConfig = z.infer<typeof secretsLocalEncryptedConfigSchema>;
 export type AuthConfig = z.infer<typeof authConfigSchema>;
+export type AuthTwoFactorConfig = z.infer<typeof authTwoFactorConfigSchema>;
+export type AuthSsoConfig = z.infer<typeof authSsoConfigSchema>;
+export type AuthSsoProviderConfig = z.infer<typeof authSsoProviderConfigSchema>;
 export type TelemetryConfig = z.infer<typeof telemetryConfigSchema>;
 export type ConfigMeta = z.infer<typeof configMetaSchema>;
 export type DatabaseBackupConfig = z.infer<typeof databaseBackupConfigSchema>;
