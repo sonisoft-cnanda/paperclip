@@ -97,8 +97,15 @@ export const authConfigSchema = z.object({
   baseUrlMode: z.enum(AUTH_BASE_URL_MODES).default("auto"),
   publicBaseUrl: z.string().url().optional(),
   disableSignUp: z.boolean().default(false),
-  twoFactor: authTwoFactorConfigSchema.default({ enabled: false, enforcement: "optional" }),
-  sso: authSsoConfigSchema.default({ enabled: false, providers: [] }),
+  // `.optional()` rather than `.default()` on purpose. Zod's `.default()` leaves
+  // a field optional on *input* but makes it required on the inferred *output*
+  // type, and the CLI builds `auth:` literals annotated with that output type
+  // (AuthConfig) — so a default here forces every CLI call site to spell out
+  // auth blocks it has no interest in, and breaks again on the next field added.
+  // Defaults are applied where the config is consumed instead: see the
+  // `fileConfig?.auth?.…  ?? <default>` reads in server/src/config.ts.
+  twoFactor: authTwoFactorConfigSchema.optional(),
+  sso: authSsoConfigSchema.optional(),
 });
 
 export const storageLocalDiskConfigSchema = z.object({
