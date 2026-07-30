@@ -1,6 +1,8 @@
 import {
+  authClientConfigSchema,
   authSessionSchema,
   currentUserProfileSchema,
+  type AuthClientConfig,
   type AuthSession,
   type CurrentUserProfile,
   type UpdateCurrentUserProfile,
@@ -36,6 +38,33 @@ function toSession(value: unknown): AuthSession | null {
   if (!value || typeof value !== "object") return null;
   const nested = authSessionSchema.safeParse((value as Record<string, unknown>).data);
   return nested.success ? nested.data : null;
+}
+
+/**
+ * A password sign-in either completes, or is held pending a second factor.
+ * BetterAuth signals the latter with HTTP 200 + `{ twoFactorRedirect: true }`,
+ * having already deleted the credential session it briefly created.
+ */
+export type SignInResult =
+  | { status: "signed_in" }
+  | { status: "two_factor_required"; methods: string[] };
+
+export type TwoFactorEnableResult = {
+  totpURI: string;
+  backupCodes: string[];
+};
+
+function toSignInResult(payload: unknown): SignInResult {
+  if (payload && typeof payload === "object") {
+    const body = payload as { twoFactorRedirect?: unknown; twoFactorMethods?: unknown };
+    if (body.twoFactorRedirect === true) {
+      const methods = Array.isArray(body.twoFactorMethods)
+        ? body.twoFactorMethods.filter((m): m is string => typeof m === "string")
+        : [];
+      return { status: "two_factor_required", methods };
+    }
+  }
+  return { status: "signed_in" };
 }
 
 function extractAuthError(payload: AuthErrorBody, status: number) {
@@ -157,8 +186,13 @@ export const authApi = {
     return nested;
   },
 
-  signInEmail: async (input: { email: string; password: string }) => {
-    await authPost("/sign-in/email", input);
+  // Returns the response body rather than discarding it: when the user has 2FA
+  // enabled BetterAuth answers a *successful* password sign-in with
+  // `{ twoFactorRedirect: true }` and no session, so the caller must inspect
+  // the body to know whether to navigate or show the TOTP step.
+  signInEmail: async (input: { email: string; password: string }): Promise<SignInResult> => {
+    const payload = await authPost("/sign-in/email", input);
+    return toSignInResult(payload);
   },
 
   signUpEmail: async (input: { name: string; email: string; password: string }) => {
@@ -182,5 +216,77 @@ export const authApi = {
 
   signOut: async () => {
     await authPost("/sign-out", {});
+  },
+
+  // Auth capabilities available before sign-in (which flows are on, which SSO
+  // providers are usable). Public endpoint — safe to call unauthenticated.
+  getAuthConfig: async (): Promise<AuthClientConfig> => {
+    const res = await fetch("/api/auth/config", {
+      credentials: "include",
+      headers: { Accept: "application/json" },
+    });
+    const payload = await res.json().catch(() => null);
+    if (!res.ok) {
+      throw new Error(`Failed to load auth config (${res.status})`);
+    }
+    return authClientConfigSchema.parse(payload);
+  },
+
+  twoFactor: {
+    // Enrollment. `password` is re-checked by BetterAuth before the secret is
+    // issued. Returns the otpauth:// URI plus one-time backup codes.
+    enable: async (input: { password: string }): Promise<TwoFactorEnableResult> => {
+      const payload = await authPost("/two-factor/enable", input);
+      const body = (payload ?? {}) as { totpURI?: unknown; backupCodes?: unknown };
+      return {
+        totpURI: typeof body.totpURI === "string" ? body.totpURI : "",
+        backupCodes: Array.isArray(body.backupCodes)
+          ? body.backupCodes.filter((c): c is string => typeof c === "string")
+          : [],
+      };
+    },
+
+    disable: async (input: { password: string }) => {
+      await authPost("/two-factor/disable", input);
+    },
+
+    // Confirms the authenticator app is generating correct codes. Also the
+    // second step of sign-in, where `trustDevice` may be offered.
+    verifyTotp: async (input: { code: string; trustDevice?: boolean }) => {
+      await authPost("/two-factor/verify-totp", input);
+    },
+
+    verifyBackupCode: async (input: { code: string }) => {
+      await authPost("/two-factor/verify-backup-code", input);
+    },
+
+    // Invalidates the previous set. BetterAuth exposes no way to re-read
+    // existing codes, so these are shown once and cannot be recovered.
+    generateBackupCodes: async (input: { password: string }): Promise<string[]> => {
+      const payload = await authPost("/two-factor/generate-backup-codes", input);
+      const body = (payload ?? {}) as { backupCodes?: unknown };
+      return Array.isArray(body.backupCodes)
+        ? body.backupCodes.filter((c): c is string => typeof c === "string")
+        : [];
+    },
+
+    // Server-rendered so the published @paperclipai/ui package needs no QR dep.
+    renderQr: async (totpURI: string): Promise<string> => {
+      const payload = await authPost("/totp-qr", { totpURI });
+      const body = (payload ?? {}) as { svg?: unknown };
+      return typeof body.svg === "string" ? body.svg : "";
+    },
+  },
+
+  // Starts the OIDC round-trip. BetterAuth replies with the IdP authorization
+  // URL, which the browser then navigates to.
+  signInSso: async (providerId: string): Promise<string> => {
+    const payload = await authPost("/sign-in/oauth2", {
+      providerId,
+      callbackURL: window.location.origin,
+    });
+    const body = (payload ?? {}) as { url?: unknown; redirect?: unknown };
+    if (typeof body.url === "string" && body.url.length > 0) return body.url;
+    throw new AuthApiError("The identity provider did not return a sign-in URL", 502, payload);
   },
 };

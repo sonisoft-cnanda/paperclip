@@ -2,16 +2,22 @@ import type { Request, RequestHandler } from "express";
 import type { IncomingHttpHeaders } from "node:http";
 import { betterAuth, type Auth } from "better-auth";
 import { drizzleAdapter } from "better-auth/adapters/drizzle";
+import { genericOAuth, twoFactor } from "better-auth/plugins";
 import { toNodeHandler } from "better-auth/node";
 import type { Db } from "@paperclipai/db";
 import {
   authAccounts,
   authSessions,
+  authTwoFactors,
   authUsers,
   authVerifications,
 } from "@paperclipai/db";
 import type { Config } from "../config.js";
 import { resolvePaperclipInstanceId } from "../home-paths.js";
+import { logger } from "../middleware/logger.js";
+
+/** Shown as the account label in authenticator apps. */
+const TWO_FACTOR_ISSUER = "Paperclip";
 
 export type BetterAuthSessionUser = {
   id: string;
@@ -144,6 +150,68 @@ export function deriveAuthTrustedOrigins(config: Config, opts?: { listenPort?: n
   return Array.from(trustedOrigins);
 }
 
+export type ResolvedSsoProvider = {
+  providerId: string;
+  displayName: string;
+};
+
+/**
+ * Build the `genericOAuth` provider list from config, resolving each client
+ * secret from `process.env[clientSecretEnv]` (the same convention as
+ * BETTER_AUTH_SECRET — secrets never live in config.json).
+ *
+ * A provider whose secret env var is unset is skipped rather than throwing, so
+ * a misconfigured IdP cannot stop the instance from booting. Skipped providers
+ * are also absent from `listConfiguredSsoProviders`, so the UI never offers a
+ * sign-in button that is guaranteed to fail.
+ */
+export function buildSsoProviderConfigs(
+  config: Config,
+  env: NodeJS.ProcessEnv = process.env,
+): { configs: Record<string, unknown>[]; skipped: string[] } {
+  if (!config.authSsoEnabled) return { configs: [], skipped: [] };
+
+  const configs: Record<string, unknown>[] = [];
+  const skipped: string[] = [];
+  for (const provider of config.authSsoProviders) {
+    const clientSecret = env[provider.clientSecretEnv]?.trim();
+    if (!clientSecret) {
+      skipped.push(provider.providerId);
+      continue;
+    }
+    configs.push({
+      providerId: provider.providerId,
+      clientId: provider.clientId,
+      clientSecret,
+      scopes: provider.scopes,
+      // Per-provider: `auth.disableSignUp` only covers emailAndPassword, so
+      // without this an SSO login JIT-creates users regardless of that setting.
+      disableSignUp: provider.disableSignUp,
+      ...(provider.discoveryUrl ? { discoveryUrl: provider.discoveryUrl } : {}),
+      ...(provider.issuer ? { issuer: provider.issuer } : {}),
+      ...(provider.authorizationUrl ? { authorizationUrl: provider.authorizationUrl } : {}),
+      ...(provider.tokenUrl ? { tokenUrl: provider.tokenUrl } : {}),
+      ...(provider.userInfoUrl ? { userInfoUrl: provider.userInfoUrl } : {}),
+    });
+  }
+  return { configs, skipped };
+}
+
+/** Providers that are actually usable — safe to expose to unauthenticated clients. */
+export function listConfiguredSsoProviders(
+  config: Config,
+  env: NodeJS.ProcessEnv = process.env,
+): ResolvedSsoProvider[] {
+  const { configs } = buildSsoProviderConfigs(config, env);
+  const usable = new Set(configs.map((entry) => entry.providerId as string));
+  return config.authSsoProviders
+    .filter((provider) => usable.has(provider.providerId))
+    .map((provider) => ({
+      providerId: provider.providerId,
+      displayName: provider.displayName ?? provider.providerId,
+    }));
+}
+
 export function createBetterAuthInstance(db: Db, config: Config, trustedOrigins: string[]): BetterAuthInstance {
   const baseUrl = config.authBaseUrlMode === "explicit" ? config.authPublicBaseUrl : undefined;
   const publicUrl = process.env.PAPERCLIP_PUBLIC_URL?.trim() || baseUrl;
@@ -162,6 +230,21 @@ export function createBetterAuthInstance(db: Db, config: Config, trustedOrigins:
     publicUrl,
   });
 
+  const { configs: ssoProviderConfigs, skipped: skippedSsoProviders } = buildSsoProviderConfigs(config);
+  if (skippedSsoProviders.length > 0) {
+    logger.error(
+      { providers: skippedSsoProviders },
+      "SSO providers skipped: their clientSecretEnv variable is unset. They will not be offered at sign-in.",
+    );
+  }
+
+  const plugins = [
+    ...(config.authTwoFactorEnabled ? [twoFactor({ issuer: TWO_FACTOR_ISSUER })] : []),
+    ...(ssoProviderConfigs.length > 0
+      ? [genericOAuth({ config: ssoProviderConfigs as never })]
+      : []),
+  ];
+
   const authConfig = {
     baseURL: baseUrl,
     secret,
@@ -173,8 +256,37 @@ export function createBetterAuthInstance(db: Db, config: Config, trustedOrigins:
         session: authSessions,
         account: authAccounts,
         verification: authVerifications,
+        // Required: the adapter schema map is closed, so the two-factor plugin's
+        // model must be registered here or its queries fail at runtime.
+        twoFactor: authTwoFactors,
       },
     }),
+    plugins,
+    // An OIDC sign-in whose email matches an existing user links to that user
+    // instead of creating a duplicate. This keeps board API keys working across
+    // an SSO rollout: they resolve through the owning user row, which must
+    // survive rather than be replaced by a JIT-created account.
+    account: {
+      accountLinking: {
+        enabled: ssoProviderConfigs.length > 0,
+        trustedProviders: ssoProviderConfigs.map((entry) => entry.providerId as string),
+        // Required, not optional. BetterAuth defaults this to true, which
+        // demands the *local* user already be email-verified — but Paperclip
+        // sets `requireEmailVerification: false` below and has no verification
+        // flow, so `user.emailVerified` is always false. Left at the default,
+        // linking can never succeed and every SSO login for an existing email
+        // fails with `account_not_linked`.
+        //
+        // Security precondition: this makes an unverified local account
+        // linkable by a trusted IdP identity with the same address. That is
+        // only safe when local account creation is controlled — keep
+        // `auth.disableSignUp: true` (and provision via invites) on any
+        // instance where users do not already own their email addresses.
+        // Otherwise someone could pre-register a colleague's address and
+        // capture their first SSO sign-in.
+        requireLocalEmailVerified: false,
+      },
+    },
     emailAndPassword: {
       enabled: true,
       requireEmailVerification: false,

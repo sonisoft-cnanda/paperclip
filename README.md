@@ -389,6 +389,22 @@ See [doc/DEVELOPING.md](doc/DEVELOPING.md) for the full development guide.
 
 <br/>
 
+## Authentication
+
+Paperclip runs in one of two modes: `local_trusted` (single-user local, no login)
+or `authenticated` (login required). In authenticated mode you can optionally add
+two-factor auth and single sign-on, so Paperclip enforces login directly and no
+front-door proxy is needed.
+
+- [doc/AUTH-MFA-SSO.md](doc/AUTH-MFA-SSO.md) — MFA (TOTP) and SSO: how they behave, enforcement, account linking, recovery
+- [doc/AUTH-SSO-PROVIDERS.md](doc/AUTH-SSO-PROVIDERS.md) — provider setup recipes: Microsoft Entra ID, Okta, Google Workspace, Auth0, Keycloak, and plain OAuth 2.0
+- [doc/DEPLOYMENT-MODES.md](doc/DEPLOYMENT-MODES.md) — deployment and auth mode model
+
+Both features are off by default. Agent and board API keys authenticate on a
+separate path and are unaffected by MFA.
+
+<br/>
+
 ## Roadmap
 
 - ✅ Plugin system (e.g. add a knowledge base, custom tracing, queues, etc)

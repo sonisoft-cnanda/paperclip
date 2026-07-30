@@ -1,6 +1,7 @@
 import { z } from "zod";
 import {
   AUTH_BASE_URL_MODES,
+  AUTH_TWO_FACTOR_ENFORCEMENTS,
   BIND_MODES,
   DEPLOYMENT_EXPOSURES,
   DEPLOYMENT_MODES,
@@ -56,10 +57,55 @@ export const serverConfigSchema = z.object({
   serveUi: z.boolean().default(true),
 });
 
+export const authTwoFactorConfigSchema = z.object({
+  enabled: z.boolean().default(false),
+  // "optional": users opt in from profile settings.
+  // "required": enrolled users are challenged and un-enrolled users are pushed to enrollment.
+  enforcement: z.enum(AUTH_TWO_FACTOR_ENFORCEMENTS).default("optional"),
+});
+
+export const authSsoProviderConfigSchema = z.object({
+  providerId: z.string().min(1),
+  discoveryUrl: z.string().url().optional(),
+  issuer: z.string().url().optional(),
+  authorizationUrl: z.string().url().optional(),
+  tokenUrl: z.string().url().optional(),
+  userInfoUrl: z.string().url().optional(),
+  clientId: z.string().min(1),
+  // Name of the process.env var holding the client secret. The secret itself is
+  // never stored in config.json — see server/src/auth/better-auth.ts.
+  clientSecretEnv: z.string().min(1),
+  scopes: z.array(z.string().min(1)).default(["openid", "email", "profile"]),
+  displayName: z.string().min(1).optional(),
+  // When true, an SSO login only succeeds for a user that already exists —
+  // typically one pre-provisioned via a company invite. Without this, anyone in
+  // the IdP's directory can authenticate and be created as a Paperclip user
+  // (they land with no company access, but the row exists). Note this is
+  // separate from `auth.disableSignUp`, which only governs email/password.
+  disableSignUp: z.boolean().default(false),
+}).refine(
+  (value) => Boolean(value.discoveryUrl ?? value.issuer ?? (value.authorizationUrl && value.tokenUrl)),
+  { message: "Provide discoveryUrl, issuer, or both authorizationUrl and tokenUrl" },
+);
+
+export const authSsoConfigSchema = z.object({
+  enabled: z.boolean().default(false),
+  providers: z.array(authSsoProviderConfigSchema).default([]),
+});
+
 export const authConfigSchema = z.object({
   baseUrlMode: z.enum(AUTH_BASE_URL_MODES).default("auto"),
   publicBaseUrl: z.string().url().optional(),
   disableSignUp: z.boolean().default(false),
+  // `.optional()` rather than `.default()` on purpose. Zod's `.default()` leaves
+  // a field optional on *input* but makes it required on the inferred *output*
+  // type, and the CLI builds `auth:` literals annotated with that output type
+  // (AuthConfig) — so a default here forces every CLI call site to spell out
+  // auth blocks it has no interest in, and breaks again on the next field added.
+  // Defaults are applied where the config is consumed instead: see the
+  // `fileConfig?.auth?.…  ?? <default>` reads in server/src/config.ts.
+  twoFactor: authTwoFactorConfigSchema.optional(),
+  sso: authSsoConfigSchema.optional(),
 });
 
 export const storageLocalDiskConfigSchema = z.object({
@@ -194,6 +240,9 @@ export type StorageS3Config = z.infer<typeof storageS3ConfigSchema>;
 export type SecretsConfig = z.infer<typeof secretsConfigSchema>;
 export type SecretsLocalEncryptedConfig = z.infer<typeof secretsLocalEncryptedConfigSchema>;
 export type AuthConfig = z.infer<typeof authConfigSchema>;
+export type AuthTwoFactorConfig = z.infer<typeof authTwoFactorConfigSchema>;
+export type AuthSsoConfig = z.infer<typeof authSsoConfigSchema>;
+export type AuthSsoProviderConfig = z.infer<typeof authSsoProviderConfigSchema>;
 export type TelemetryConfig = z.infer<typeof telemetryConfigSchema>;
 export type ConfigMeta = z.infer<typeof configMetaSchema>;
 export type DatabaseBackupConfig = z.infer<typeof databaseBackupConfigSchema>;

@@ -173,6 +173,7 @@ future public-hosted setup design explicitly changes this policy.
 
 ## 11. Relationship to Other Docs
 
+- MFA (TOTP) and SSO (OIDC): `doc/AUTH-MFA-SSO.md`
 - implementation plan: `doc/plans/deployment-auth-mode-consolidation.md`
 - V1 contract: `doc/SPEC-implementation.md`
 - operator workflows: `doc/DEVELOPING.md` and `doc/CLI.md`

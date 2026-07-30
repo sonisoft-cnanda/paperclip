@@ -207,6 +207,7 @@ import {
   toolPolicyTestRequestSchema,
   createToolMcpGatewaySchema,
 } from "@paperclipai/shared";
+import { totpQrRequestSchema } from "./auth.js";
 
 type JsonSchema = Record<string, unknown>;
 type OpenApiResponse = Record<string, unknown>;
@@ -3653,6 +3654,26 @@ registry.registerPath({
   tags: ["auth"],
   summary: "Update current user profile",
   request: { body: jsonBody(updateCurrentUserProfileSchema) },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/auth/config",
+  tags: ["auth"],
+  summary: "Get public auth capabilities (MFA/SSO availability)",
+  description:
+    "Unauthenticated: the sign-in page needs this before a session exists. " +
+    "Reports whether two-factor is enabled and which SSO providers resolved a client secret. Contains no secrets.",
+  responses: { 200: r.ok() },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/auth/totp-qr",
+  tags: ["auth"],
+  summary: "Render a TOTP enrollment URI as an SVG QR code",
+  request: { body: jsonBody(totpQrRequestSchema) },
   responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },
 });
 

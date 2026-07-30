@@ -1,11 +1,14 @@
 import { afterEach, describe, expect, it } from "vitest";
 import type { BetterAuthOptions } from "better-auth";
+import { authSsoProviderConfigSchema } from "@paperclipai/shared";
 import { getCookies } from "better-auth/cookies";
 import {
   buildBetterAuthAdvancedOptions,
   buildBetterAuthRateLimitOptions,
+  buildSsoProviderConfigs,
   deriveAuthCookiePrefix,
   deriveAuthTrustedOrigins,
+  listConfiguredSsoProviders,
   shouldDisableSecureAuthCookies,
 } from "../auth/better-auth.js";
 
@@ -211,5 +214,107 @@ describe("Better Auth cookie scoping", () => {
     ]));
     expect(trustedOrigins).not.toContain("https://board.example.test:3100");
     expect(trustedOrigins).not.toContain("http://board.example.test:3100");
+  });
+});
+
+describe("SSO provider resolution", () => {
+  const provider = {
+    providerId: "okta",
+    clientId: "client-id",
+    clientSecretEnv: "PAPERCLIP_SSO_OKTA_CLIENT_SECRET",
+    discoveryUrl: "https://example.okta.com/.well-known/openid-configuration",
+    scopes: ["openid", "email", "profile"],
+  };
+
+  function configWith(overrides: Record<string, unknown>) {
+    return {
+      authSsoEnabled: true,
+      authSsoProviders: [provider],
+      ...overrides,
+    } as Parameters<typeof buildSsoProviderConfigs>[0];
+  }
+
+  it("resolves the client secret from the configured env var", () => {
+    const { configs, skipped } = buildSsoProviderConfigs(configWith({}), {
+      PAPERCLIP_SSO_OKTA_CLIENT_SECRET: "s3cret",
+    } as NodeJS.ProcessEnv);
+
+    expect(skipped).toEqual([]);
+    expect(configs).toHaveLength(1);
+    expect(configs[0]).toMatchObject({
+      providerId: "okta",
+      clientId: "client-id",
+      clientSecret: "s3cret",
+      discoveryUrl: provider.discoveryUrl,
+    });
+  });
+
+  it("skips a provider whose secret env var is unset instead of throwing", () => {
+    const { configs, skipped } = buildSsoProviderConfigs(configWith({}), {} as NodeJS.ProcessEnv);
+
+    expect(configs).toEqual([]);
+    expect(skipped).toEqual(["okta"]);
+  });
+
+  it("treats a blank secret as unset", () => {
+    const { configs, skipped } = buildSsoProviderConfigs(configWith({}), {
+      PAPERCLIP_SSO_OKTA_CLIENT_SECRET: "   ",
+    } as NodeJS.ProcessEnv);
+
+    expect(configs).toEqual([]);
+    expect(skipped).toEqual(["okta"]);
+  });
+
+  it("defaults disableSignUp to false so SSO keeps working out of the box", () => {
+    // The default lives in the schema, so assert it there rather than against a
+    // hand-built fixture that would never exercise it.
+    const parsed = authSsoProviderConfigSchema.parse({
+      providerId: "okta",
+      clientId: "client-id",
+      clientSecretEnv: "PAPERCLIP_SSO_OKTA_CLIENT_SECRET",
+      discoveryUrl: "https://example.okta.com/.well-known/openid-configuration",
+    });
+
+    expect(parsed.disableSignUp).toBe(false);
+  });
+
+  it("passes disableSignUp through so SSO can be limited to pre-provisioned users", () => {
+    const config = configWith({
+      authSsoProviders: [{ ...provider, disableSignUp: true }],
+    });
+
+    const { configs } = buildSsoProviderConfigs(config, {
+      PAPERCLIP_SSO_OKTA_CLIENT_SECRET: "s3cret",
+    } as NodeJS.ProcessEnv);
+
+    expect(configs[0]).toMatchObject({ disableSignUp: true });
+  });
+
+  it("resolves nothing when SSO is disabled", () => {
+    const { configs } = buildSsoProviderConfigs(configWith({ authSsoEnabled: false }), {
+      PAPERCLIP_SSO_OKTA_CLIENT_SECRET: "s3cret",
+    } as NodeJS.ProcessEnv);
+
+    expect(configs).toEqual([]);
+  });
+
+  it("only advertises providers that actually resolved a secret", () => {
+    const env = { PAPERCLIP_SSO_OKTA_CLIENT_SECRET: "s3cret" } as NodeJS.ProcessEnv;
+    const config = configWith({
+      authSsoProviders: [
+        { ...provider, displayName: "Okta" },
+        { ...provider, providerId: "entra", clientSecretEnv: "PAPERCLIP_SSO_ENTRA_CLIENT_SECRET" },
+      ],
+    });
+
+    expect(listConfiguredSsoProviders(config, env)).toEqual([
+      { providerId: "okta", displayName: "Okta" },
+    ]);
+  });
+
+  it("falls back to the provider id when no display name is configured", () => {
+    expect(listConfiguredSsoProviders(configWith({}), {
+      PAPERCLIP_SSO_OKTA_CLIENT_SECRET: "s3cret",
+    } as NodeJS.ProcessEnv)).toEqual([{ providerId: "okta", displayName: "okta" }]);
   });
 });

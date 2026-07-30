@@ -55,6 +55,12 @@ import {
 } from "./routes/instance-database-backups.js";
 import { llmRoutes } from "./routes/llms.js";
 import { authRoutes } from "./routes/auth.js";
+import type { AuthClientConfig } from "@paperclipai/shared";
+
+const DEFAULT_AUTH_CLIENT_CONFIG: AuthClientConfig = {
+  twoFactor: { enabled: false, enforcement: "optional" },
+  sso: { providers: [] },
+};
 import { assetRoutes } from "./routes/assets.js";
 import { accessRoutes } from "./routes/access.js";
 import { pluginRoutes } from "./routes/plugins.js";
@@ -178,6 +184,11 @@ export async function createApp(
     betterAuthHandler?: express.RequestHandler;
     resolveSession?: (req: ExpressRequest) => Promise<BetterAuthSessionResult | null>;
     /**
+     * Auth capabilities exposed to unauthenticated clients via GET /api/auth/config.
+     * Defaults to "everything off", which is correct for local_trusted mode.
+     */
+    authClientConfig?: AuthClientConfig;
+    /**
      * `plugins.autoInstall` from the managed config (PAPERCLIP_MANAGED_CONFIG).
      * `null`/absent ⇒ self-hosted: only the built-in kubernetes bundle is
      * ensured, exactly as before. A managed list is resolved against the
@@ -230,7 +241,7 @@ export async function createApp(
       resolveSession: opts.resolveSession,
     }),
   );
-  app.use("/api/auth", authRoutes(db));
+  app.use("/api/auth", authRoutes(db, opts.authClientConfig ?? DEFAULT_AUTH_CLIENT_CONFIG));
   if (opts.betterAuthHandler) {
     app.all("/api/auth/{*authPath}", opts.betterAuthHandler);
   }

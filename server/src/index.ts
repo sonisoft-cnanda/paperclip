@@ -11,6 +11,7 @@ import { createInterface } from "node:readline/promises";
 import { stdin, stdout } from "node:process";
 import { pathToFileURL } from "node:url";
 import type { Request as ExpressRequest, RequestHandler } from "express";
+import type { AuthClientConfig } from "@paperclipai/shared";
 import { and, eq } from "drizzle-orm";
 import {
   createDb,
@@ -542,6 +543,11 @@ export async function startServer(): Promise<StartedServer> {
   let resolveSessionFromHeaders:
     | ((headers: Headers) => Promise<BetterAuthSessionResult | null>)
     | undefined;
+  // Stays "everything off" in local_trusted mode, where better-auth is never loaded.
+  let authClientConfig: AuthClientConfig = {
+    twoFactor: { enabled: false, enforcement: "optional" },
+    sso: { providers: [] },
+  };
   if (config.deploymentMode === "local_trusted") {
     await ensureLocalTrustedBoardPrincipal(db as any);
   }
@@ -558,6 +564,7 @@ export async function startServer(): Promise<StartedServer> {
       createBetterAuthHandler,
       createBetterAuthInstance,
       deriveAuthTrustedOrigins,
+      listConfiguredSsoProviders,
       resolveBetterAuthSession,
       resolveBetterAuthSessionFromHeaders,
     } = await import("./auth/better-auth.js");
@@ -584,6 +591,13 @@ export async function startServer(): Promise<StartedServer> {
     resolveSession = (req) => resolveBetterAuthSession(auth, req);
     resolveSessionFromHeaders = (headers) => resolveBetterAuthSessionFromHeaders(auth, headers);
     await initializeBoardClaimChallenge(db as any, { deploymentMode: config.deploymentMode });
+    authClientConfig = {
+      twoFactor: {
+        enabled: config.authTwoFactorEnabled,
+        enforcement: config.authTwoFactorEnforcement,
+      },
+      sso: { providers: listConfiguredSsoProviders(config) },
+    };
     authReady = true;
   }
 
@@ -735,6 +749,7 @@ export async function startServer(): Promise<StartedServer> {
     pluginMigrationDb: pluginMigrationDb as any,
     betterAuthHandler,
     resolveSession,
+    authClientConfig,
     pluginWorkerManager,
     managedPluginAutoInstall,
   });
