@@ -65,9 +65,21 @@ const mockApprovalService = vi.hoisted(() => ({
 }));
 
 const mockInstanceSettingsService = vi.hoisted(() => ({
-  get: vi.fn(async () => ({ defaultEnvironmentId: null })),
+  get: vi.fn(async () => ({
+    defaultEnvironmentId: null as string | null,
+    general: { executionMode: "any" as "any" | "kubernetes" },
+  })),
   getGeneral: vi.fn(async () => ({ censorUsernameInLogs: false })),
-  getExperimental: vi.fn(async () => ({ enableNativeRunner: false })),
+  getExperimental: vi.fn<() => Promise<{ enableNativeRunner: boolean; enableManagedSandboxOnly?: boolean }>>(async () => ({ enableNativeRunner: false })),
+}));
+
+const mockEnvironmentService = vi.hoisted(() => ({
+  getById: vi.fn(),
+  findManagedSandboxEnvironment: vi.fn(),
+}));
+
+vi.mock("../services/environments.js", () => ({
+  environmentService: () => mockEnvironmentService,
 }));
 
 const mockManagedAgentProfileService = vi.hoisted(() => ({
@@ -114,6 +126,9 @@ vi.mock("../services/remote-agent-profiles.js", () => ({
 }));
 
 function registerModuleMocks() {
+  vi.doMock("../services/environments.js", () => ({
+    environmentService: () => mockEnvironmentService,
+  }));
   vi.doMock("../services/index.js", () => ({
     agentService: () => mockAgentService,
     agentInstructionsService: () => mockAgentInstructionsService,
@@ -173,7 +188,7 @@ const externalAdapter: ServerAdapterModule = {
 
 const missingAdapterType = "missing_adapter_validation_test";
 
-async function createApp() {
+async function createApp(actor?: Record<string, unknown>) {
   const [{ agentRoutes }, { errorHandler }] = await Promise.all([
     vi.importActual<typeof import("../routes/agents.js")>("../routes/agents.js"),
     vi.importActual<typeof import("../middleware/index.js")>("../middleware/index.js"),
@@ -181,7 +196,7 @@ async function createApp() {
   const app = express();
   app.use(express.json());
   app.use((req, _res, next) => {
-    (req as any).actor = {
+    (req as any).actor = actor ?? {
       type: "board",
       userId: "local-board",
       companyIds: ["company-1"],
@@ -262,7 +277,10 @@ describe("agent routes adapter validation", () => {
     mockAccessService.setPrincipalPermission.mockResolvedValue(undefined);
     mockLogActivity.mockResolvedValue(undefined);
     mockSecretService.syncEnvBindingsForTarget.mockResolvedValue(undefined);
+    mockInstanceSettingsService.get.mockResolvedValue({ defaultEnvironmentId: null, general: { executionMode: "any" } });
     mockInstanceSettingsService.getExperimental.mockResolvedValue({ enableNativeRunner: false });
+    mockEnvironmentService.getById.mockResolvedValue(null);
+    mockEnvironmentService.findManagedSandboxEnvironment.mockResolvedValue(null);
     mockManagedAgentProfileService.requireQualified.mockResolvedValue({
       id: "managed-primary",
       companyId: "company-1",
@@ -1123,6 +1141,152 @@ describe("agent routes adapter validation", () => {
       code: "paperclip_runner_claude_managed_retention_required",
     });
     expect(mockAgentService.rollbackConfigRevision).not.toHaveBeenCalled();
+  });
+
+  describe("explicit local Codex host-auth reset", () => {
+    const agentPath = "/api/agents/11111111-1111-4111-8111-111111111111";
+    const binding = { provider: "openai", method: "subscription", mode: "responsible_user" };
+    const heartbeat = { enabled: false, maxConcurrentRuns: 2 };
+
+    beforeEach(async () => {
+      const existing = await mockAgentService.getById();
+      mockAgentService.getById.mockResolvedValue({
+        ...existing,
+        adapterConfig: { model: "gpt-6.1-sol", engine: "cli", env: { CODEX_PATH: "/usr/local/bin/codex" } },
+        runtimeConfig: { aiConnection: binding, heartbeat, customRuntimeSetting: { preserved: true } },
+        defaultEnvironmentId: null,
+      });
+    });
+
+    it("clears a binding without history and preserves every other configuration field", async () => {
+      const existing = await mockAgentService.getById();
+      const app = await createApp();
+      const res = await requestApp(app, baseUrl => request(baseUrl).patch(agentPath).send({ clearAiConnection: true }));
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(res.body.runtimeConfig).toEqual({ heartbeat, customRuntimeSetting: { preserved: true } });
+      expect(res.body.adapterConfig).toEqual({
+        ...existing.adapterConfig,
+        env: { CODEX_PATH: { type: "plain", value: "***REDACTED***" } },
+      });
+      expect(res.body.status).toBe(existing.status);
+      expect(mockAgentService.update).toHaveBeenCalledExactlyOnceWith(existing.id, {
+        runtimeConfig: { heartbeat, customRuntimeSetting: { preserved: true } },
+      }, expect.objectContaining({
+        recordRevision: { createdByAgentId: null, createdByUserId: "local-board", source: "patch" },
+      }));
+      expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+        companyId: existing.companyId,
+        action: "agent.updated",
+        details: expect.objectContaining({ aiConnectionCleared: true }),
+      }));
+      expect(mockAgentService.getConfigRevision).not.toHaveBeenCalled();
+      expect(mockAgentService.rollbackConfigRevision).not.toHaveBeenCalled();
+      expect(mockHeartbeatService.cancelActiveForAgent).not.toHaveBeenCalled();
+    });
+
+    it.each([undefined, false])("preserves the binding when the clear flag is %s", async flag => {
+      const app = await createApp();
+      const res = await requestApp(app, baseUrl => request(baseUrl).patch(agentPath).send({
+        ...(flag === undefined ? {} : { clearAiConnection: flag }),
+        runtimeConfig: { heartbeat },
+      }));
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(res.body.runtimeConfig.aiConnection).toEqual(binding);
+      expect(mockAgentService.update.mock.calls[0][1]).not.toHaveProperty("clearAiConnection");
+    });
+
+    it("rejects conflicting clear and connection selection", async () => {
+      const app = await createApp();
+      const res = await requestApp(app, baseUrl => request(baseUrl).patch(agentPath).send({
+        clearAiConnection: true,
+        runtimeConfig: { aiConnection: binding },
+      }));
+      expect(res.status).toBe(422);
+      expect(mockAgentService.update).not.toHaveBeenCalled();
+    });
+
+    it("does not let an authorized agent select the host credential path", async () => {
+      const app = await createApp({ type: "agent", agentId: "manager", companyId: "company-1" });
+      const res = await requestApp(app, baseUrl => request(baseUrl).patch(agentPath).send({ clearAiConnection: true }));
+      expect(res.status).toBe(403);
+      expect(mockAgentService.update).not.toHaveBeenCalled();
+    });
+
+    it("requires the board user's update permission", async () => {
+      mockAccessService.decide.mockResolvedValue({ allowed: false, reason: "deny_no_grant", explanation: "No update grant" });
+      const app = await createApp();
+      const res = await requestApp(app, baseUrl => request(baseUrl).patch(agentPath).send({ clearAiConnection: true }));
+      expect(res.status).toBe(403);
+      expect(mockAgentService.update).not.toHaveBeenCalled();
+    });
+
+    it("conceals agents in other companies", async () => {
+      const app = await createApp({ type: "board", userId: "other-board", source: "session", companyIds: ["other-company"], isInstanceAdmin: false });
+      const res = await requestApp(app, baseUrl => request(baseUrl).patch(agentPath).send({ clearAiConnection: true }));
+      expect(res.status).toBe(404);
+      expect(mockAgentService.update).not.toHaveBeenCalled();
+    });
+
+    it.each(["claude_local", "process"])("rejects an existing %s adapter", async adapterType => {
+      const existing = await mockAgentService.getById();
+      mockAgentService.getById.mockResolvedValue({ ...existing, adapterType });
+      const app = await createApp();
+      const res = await requestApp(app, baseUrl => request(baseUrl).patch(agentPath).send({ clearAiConnection: true }));
+      expect(res.status).toBe(422);
+      expect(mockAgentService.update).not.toHaveBeenCalled();
+    });
+
+    it("rejects switching away from Codex in a reset request", async () => {
+      const app = await createApp();
+      const res = await requestApp(app, baseUrl => request(baseUrl).patch(agentPath).send({ clearAiConnection: true, adapterType: "process" }));
+      expect(res.status).toBe(422);
+      expect(mockAgentService.update).not.toHaveBeenCalled();
+    });
+
+    it.each(["ssh", "sandbox", undefined])("rejects an inherited %s or missing environment", async driver => {
+      mockInstanceSettingsService.get.mockResolvedValue({ defaultEnvironmentId: "remote-default", general: { executionMode: "any" } });
+      mockEnvironmentService.getById.mockResolvedValue(driver ? { id: "remote-default", driver } : null);
+      const app = await createApp();
+      const res = await requestApp(app, baseUrl => request(baseUrl).patch(agentPath).send({ clearAiConnection: true }));
+      expect(res.status).toBe(422);
+      expect(mockEnvironmentService.getById).toHaveBeenCalledWith("remote-default");
+      expect(mockAgentService.update).not.toHaveBeenCalled();
+    });
+
+    it("allows a saved local host environment", async () => {
+      const existing = await mockAgentService.getById();
+      mockAgentService.getById.mockResolvedValue({ ...existing, defaultEnvironmentId: "local-env" });
+      mockEnvironmentService.getById.mockResolvedValue({ id: "local-env", driver: "local" });
+      const app = await createApp();
+      const res = await requestApp(app, baseUrl => request(baseUrl).patch(agentPath).send({ clearAiConnection: true }));
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(res.body.runtimeConfig).not.toHaveProperty("aiConnection");
+      expect(res.body.defaultEnvironmentId).toBe("local-env");
+    });
+
+    it("respects managed-sandbox-only policy even with a local override", async () => {
+      const existing = await mockAgentService.getById();
+      mockAgentService.getById.mockResolvedValue({ ...existing, defaultEnvironmentId: "local-env" });
+      mockEnvironmentService.getById.mockResolvedValue({ id: "local-env", driver: "local" });
+      mockInstanceSettingsService.getExperimental.mockResolvedValue({ enableNativeRunner: false, enableManagedSandboxOnly: true });
+      const app = await createApp();
+      const res = await requestApp(app, baseUrl => request(baseUrl).patch(agentPath).send({ clearAiConnection: true }));
+      expect(res.status).toBe(422);
+      expect(mockAgentService.update).not.toHaveBeenCalled();
+    });
+
+    it.each([null, "local-env"])("rejects forced Kubernetes execution with environment %s", async defaultEnvironmentId => {
+      const existing = await mockAgentService.getById();
+      mockAgentService.getById.mockResolvedValue({ ...existing, defaultEnvironmentId });
+      mockEnvironmentService.getById.mockResolvedValue({ id: "local-env", driver: "local" });
+      mockInstanceSettingsService.get.mockResolvedValue({ defaultEnvironmentId: null, general: { executionMode: "kubernetes" } });
+      const app = await createApp();
+      const res = await requestApp(app, baseUrl => request(baseUrl).patch(agentPath).send({ clearAiConnection: true }));
+      expect(res.status).toBe(422);
+      expect(mockAgentService.update).not.toHaveBeenCalled();
+    });
   });
 
   it("keeps an existing paperclip_runner agent editable after the flag is disabled", async () => {

@@ -3418,6 +3418,7 @@ registry.registerPath({
   path: "/api/agents/{id}",
   tags: ["agents"],
   summary: "Update an agent",
+  description: "A board user with agent configuration update permission can set clearAiConnection=true to remove a local Codex agent's managed AI binding and use native host authentication. The effective environment must be local; forced Kubernetes and managed-sandbox-only policies are enforced. Other configuration is preserved unless explicitly updated. Omitting the flag preserves an existing binding. This operation does not restart runs or copy credentials.",
   request: {
     params: z.object({ id: z.string() }),
     body: jsonBody(updateAgentSchema.omit({ permissions: true })),

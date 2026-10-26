@@ -155,6 +155,9 @@ export const updateAgentSchema = objectWithoutDefaults(
   .extend({
     permissions: z.never().optional(),
     replaceAdapterConfig: z.boolean().optional(),
+    // Explicit board intent to return a local Codex agent to native host auth.
+    // Omitting aiConnection alone continues to preserve an existing binding.
+    clearAiConnection: z.boolean().optional(),
     status: z.enum(AGENT_STATUSES).optional(),
     spentMonthlyCents: z.number().int().nonnegative().optional(),
   });

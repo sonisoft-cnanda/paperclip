@@ -2,6 +2,14 @@ import { describe, expect, it } from "vitest";
 import { AGENT_ROLE_LABELS, acceptInviteSchema, createAgentSchema, updateAgentSchema } from "./index.js";
 
 describe("dynamic adapter type validation schemas", () => {
+  it("accepts explicit host-auth reset intent only on agent updates", () => {
+    expect(updateAgentSchema.parse({ clearAiConnection: true })).toEqual({ clearAiConnection: true });
+    expect(updateAgentSchema.parse({})).not.toHaveProperty("clearAiConnection");
+    expect(() => updateAgentSchema.parse({ clearAiConnection: "true" })).toThrow();
+    expect(() => updateAgentSchema.parse({ runtimeConfig: { aiConnection: null } })).toThrow();
+    expect(createAgentSchema.parse({ name: "Codex", adapterType: "codex_local", clearAiConnection: true })).not.toHaveProperty("clearAiConnection");
+  });
+
   it("accepts external adapter types in create/update agent schemas", () => {
     expect(
       createAgentSchema.parse({

@@ -5408,6 +5408,12 @@ export function agentRoutes(
     }
 
     const patchData = { ...(req.body as Record<string, unknown>) };
+    const clearAiConnection = patchData.clearAiConnection === true;
+    delete patchData.clearAiConnection;
+    if (clearAiConnection) {
+      assertBoard(req);
+      await assertCanUpdateAgent(req, existing);
+    }
     const replaceAdapterConfig = patchData.replaceAdapterConfig === true;
     delete patchData.replaceAdapterConfig;
     // The apply-existing flag is not an agent column. The server binds the fixed
@@ -5452,6 +5458,32 @@ export function agentRoutes(
         existing.runtimeConfig,
       );
       requestedRuntimeConfig = runtimeConfig;
+    }
+    if (clearAiConnection) {
+      if (existing.adapterType !== "codex_local" || requestedAdapterType !== "codex_local") {
+        throw unprocessable("Native host authentication reset is supported only for local Codex agents");
+      }
+      if (requestedRuntimeConfig?.aiConnection) {
+        throw unprocessable("Cannot clear and select an AI connection in the same update");
+      }
+      // Host credentials are unavailable to SSH and sandbox executions. Resolve
+      // inherited defaults and forced execution policies, as dispatch does.
+      const environmentId = await resolveAdapterTestEnvironmentId(
+        existing.companyId,
+        hasOwn(patchData, "defaultEnvironmentId")
+          ? patchData.defaultEnvironmentId as string | null
+          : existing.defaultEnvironmentId,
+      );
+      const environment = environmentId ? await environmentsSvc.getById(environmentId) : null;
+      if (
+        (environmentId && environment?.driver !== "local") ||
+        (await instanceSettings.get()).general.executionMode === "kubernetes" ||
+        (await instanceSettings.getExperimental()).enableManagedSandboxOnly === true
+      ) {
+        throw unprocessable("Native host authentication requires a local host environment");
+      }
+      requestedRuntimeConfig = { ...existing.runtimeConfig, ...requestedRuntimeConfig };
+      delete requestedRuntimeConfig.aiConnection;
     }
     const touchesAdapterConfiguration =
       hasOwn(patchData, "adapterType") ||
@@ -5539,8 +5571,8 @@ export function agentRoutes(
         adapterConfig: patchData.adapterConfig,
       });
     }
-    if (existing.runtimeConfig.aiConnection && requestedRuntimeConfig && !requestedRuntimeConfig.aiConnection) requestedRuntimeConfig.aiConnection = existing.runtimeConfig.aiConnection;
-    const nextAiBinding = aiConnectionBindingSchema.safeParse(requestedRuntimeConfig?.aiConnection ?? existing.runtimeConfig.aiConnection).data;
+    if (!clearAiConnection && existing.runtimeConfig.aiConnection && requestedRuntimeConfig && !requestedRuntimeConfig.aiConnection) requestedRuntimeConfig.aiConnection = existing.runtimeConfig.aiConnection;
+    const nextAiBinding = clearAiConnection ? undefined : aiConnectionBindingSchema.safeParse(requestedRuntimeConfig?.aiConnection ?? existing.runtimeConfig.aiConnection).data;
     if (nextAiBinding) {
       await assertCanUpdateAgent(req, existing);
       const changed = JSON.stringify(nextAiBinding) !== JSON.stringify(existing.runtimeConfig.aiConnection);
@@ -5601,7 +5633,10 @@ export function agentRoutes(
       action: "agent.updated",
       entityType: "agent",
       entityId: agent.id,
-      details: summarizeAgentUpdateDetails(patchData),
+      details: {
+        ...summarizeAgentUpdateDetails(patchData),
+        ...(clearAiConnection ? { aiConnectionCleared: true } : {}),
+      },
     });
 
     res.json(redactAgentRowForResponse(agent));

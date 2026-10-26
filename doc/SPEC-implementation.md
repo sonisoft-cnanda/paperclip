@@ -1080,6 +1080,16 @@ Invites tab does not hide this Cloud action.
 - `POST /agents/:agentId/keys` (create API key)
 - `POST /agents/:agentId/heartbeat/invoke`
 
+`PATCH /agents/:agentId` accepts the update-only `clearAiConnection: true`
+intent for existing `codex_local` agents. It requires a board actor with
+`agent_config:update` permission in the agent's company, a local effective
+environment, and no forced Kubernetes or managed-sandbox-only policy. It removes only the managed
+AI binding while preserving other runtime fields unless explicitly updated,
+records the normal configuration revision and activity entry, and does not
+restart runs or copy credentials. Connection selection and clearing cannot be
+combined. Omitting the flag preserves an existing binding; `aiConnection: null`
+remains invalid. Other adapters and remote environments cannot use this reset.
+
 ## 10.4 Tasks (Issues)
 
 - `GET /companies/:companyId/issues`
