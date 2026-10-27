@@ -22,6 +22,7 @@ import {
   issueRecoveryActions,
   issueRelations,
   issueThreadInteractions,
+  projects,
   workspaceOperations,
   issues,
 } from "@paperclipai/db";
@@ -255,6 +256,75 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     app.use(errorHandler);
     return app;
   }
+
+  it.each(["restored", "owner budget paused", "deliberate wait"])(
+    "checks %s recovery hand-back without borrowing a second pooled connection",
+    async (scenario) => {
+      const { companyId, coderId, sourceIssueId } = await seedCompany();
+      const projectId = randomUUID();
+      await db.insert(projects).values({ id: projectId, companyId, name: "Recovery project" });
+      await db.update(issues).set({ status: "blocked", projectId }).where(eq(issues.id, sourceIssueId));
+      if (scenario === "owner budget paused") {
+        await db.update(agents).set({ status: "paused", pauseReason: "budget" }).where(eq(agents.id, coderId));
+      }
+      const action = await issueRecoveryActionService(db).upsertSourceScoped({
+        companyId,
+        sourceIssueId,
+        kind: scenario === "deliberate wait" ? "deliberate_wait_without_target" : "issue_graph_liveness",
+        ownerType: "board",
+        ownerUserId: null,
+        returnOwnerAgentId: coderId,
+        cause: "issue_graph_liveness",
+        fingerprint: "single-connection-recovery",
+        evidence: {},
+        nextAction: "Restore the recorded source owner after checking all gates.",
+        wakePolicy: { type: "board_escalation" },
+      });
+      // The issue-row transaction owns the only connection. A service that
+      // accidentally reads through the outer pool waits on its own transaction,
+      // reproducing the production lock convoy without creating competing work.
+      const limitedDb = createDb(tempDb!.connectionString, { maxConnections: 1 });
+      const wake = vi.fn(async () => undefined);
+      const app = express();
+      app.use(express.json());
+      app.use((req, _res, next) => {
+        (req as any).actor = { type: "board", source: "local_implicit" };
+        next();
+      });
+      app.use("/api", issueRoutes(limitedDb, {} as any, { recoveryActionEnqueueWakeup: wake }));
+      const errors: unknown[] = [];
+      app.use((error: unknown, _req: express.Request, _res: express.Response, next: express.NextFunction) => {
+        errors.push(error);
+        next(error);
+      });
+      app.use(errorHandler);
+      try {
+        const response = await request(app)
+          .post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`)
+          .send({ actionId: action.id, outcome: "restored", sourceIssueStatus: "todo" })
+          .timeout({ response: 3_000, deadline: 4_000 });
+        expect(response.status, JSON.stringify({ body: response.body, errors: errors.map(String) }))
+          .toBe(scenario === "owner budget paused" ? 409 : 200);
+        if (scenario === "owner budget paused") {
+          expect(response.body.details?.code).toBe("recovery_safe_hand_back_budget_blocked");
+          const [source] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+          expect(source).toMatchObject({ status: "blocked", assigneeAgentId: coderId });
+          expect(await issueRecoveryActionService(db).getActiveForIssue(companyId, sourceIssueId))
+            .toMatchObject({ id: action.id, status: "active" });
+          expect(wake).not.toHaveBeenCalled();
+        } else {
+          expect(response.body.issue).toMatchObject({ id: sourceIssueId, status: "todo", assigneeAgentId: coderId });
+          expect(response.body.recoveryAction).toMatchObject({ id: action.id, status: "resolved", outcome: "handed_back" });
+          expect(wake).toHaveBeenCalledTimes(1);
+        }
+      } finally {
+        // Also bounds cleanup when the regression is run against broken code.
+        await limitedDb.$client.end({ timeout: 1 });
+        await db.update(issues).set({ projectId: null }).where(eq(issues.id, sourceIssueId));
+        await db.delete(projects).where(eq(projects.id, projectId));
+      }
+    },
+  );
 
   async function seedNativeFinalizationRecovery(status: string) {
     const fixture = await seedCompany();

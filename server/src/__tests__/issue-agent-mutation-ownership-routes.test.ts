@@ -2567,6 +2567,51 @@ describe("agent issue mutation checkout ownership", () => {
     expect(mockIssueService.update).not.toHaveBeenCalled();
   });
 
+  it.each(["subtree pause", "project pause", "pending execution stage"])(
+    "preserves the %s gate during safe recovery hand-back",
+    async (gate) => {
+      mockIssueService.getById.mockResolvedValue(makeIssue({
+        status: "blocked",
+        projectId: ownerRunId,
+        executionState: gate === "pending execution stage" ? {
+          status: "pending",
+          currentStageId: recoveryActionId,
+          currentStageIndex: 0,
+          currentStageType: "review",
+          currentParticipant: { type: "agent", agentId: ownerAgentId },
+          returnAssignee: { type: "agent", agentId: ownerAgentId },
+          completedStageIds: [],
+          lastDecisionId: null,
+          lastDecisionOutcome: null,
+        } : null,
+      }));
+      mockIssueRecoveryActionService.getActiveForIssue.mockResolvedValue({
+        id: recoveryActionId,
+        ownerAgentId: peerAgentId,
+        returnOwnerAgentId: ownerAgentId,
+      });
+      if (gate === "subtree pause") {
+        mockIssueTreeControlService.getActivePauseHoldGate.mockResolvedValue({
+          holdId: recoveryActionId, rootIssueId: issueId, mode: "pause",
+        } as any);
+      }
+      if (gate === "project pause") {
+        mockProjectService.getById.mockResolvedValue({
+          id: ownerRunId, pausedAt: new Date(), pauseReason: "manual",
+        } as any);
+      }
+
+      const response = await request(await createApp(boardActor()))
+        .post(`/api/issues/${issueId}/recovery-actions/resolve`)
+        .send({ actionId: recoveryActionId, outcome: "restored", sourceIssueStatus: "todo" });
+
+      expect(response.status, JSON.stringify(response.body)).toBe(409);
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+      expect(mockIssueRecoveryActionService.resolveActiveForIssue).not.toHaveBeenCalled();
+      expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+    },
+  );
+
   it("uses the authorization decision path for assignment changes", async () => {
     const decide = vi.fn(async () => ({
       allowed: false,
