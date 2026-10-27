@@ -1141,6 +1141,7 @@ async function startServerWithDatabaseTeardown(
   let heartbeatSchedulerStopped = false;
   let heartbeatSchedulerInterval: ReturnType<typeof setInterval> | null = null;
   const heartbeatSchedulerInFlight = new Set<Promise<void>>();
+  let heartbeatRecoveryInFlight = false;
   const trackHeartbeatSchedulerWork = (work: Promise<unknown>) => {
     let tracked: Promise<void>;
     tracked = Promise.resolve(work)
@@ -1769,11 +1770,14 @@ async function startServerWithDatabaseTeardown(
           }));
 
         if (heartbeatSchedulerStopped) return;
-        if (!(await heartbeat.resolveSchedulingSuppression()).suppressed) {
+        if (!(await heartbeat.resolveSchedulingSuppression()).suppressed && !heartbeatRecoveryInFlight) {
           // Periodically reap orphaned runs (5-min staleness threshold) and make sure
           // persisted queued work is still being driven forward.
-          trackHeartbeatSchedulerWork(heartbeat
-            .reapOrphanedRuns({ staleThresholdMs: 5 * 60 * 1000 })
+          // Coalesce ticks while this whole chain is pending. Durable work is
+          // reconsidered next tick; independent sweeps keep their own schedules.
+          heartbeatRecoveryInFlight = true;
+          trackHeartbeatSchedulerWork(Promise.resolve()
+            .then(() => heartbeat.reapOrphanedRuns({ staleThresholdMs: 5 * 60 * 1000 }))
             .then(() => heartbeat.promoteDueScheduledRetries())
             .then(async (promotion) => {
               await heartbeat.resumeQueuedRuns();
@@ -1819,6 +1823,9 @@ async function startServerWithDatabaseTeardown(
             })
             .catch((err) => {
               logger.error({ err }, "periodic heartbeat recovery failed");
+            })
+            .finally(() => {
+              heartbeatRecoveryInFlight = false;
             }));
         }
       })().catch((err) => {

@@ -63,6 +63,9 @@ const {
       blockedRunIds: [],
     })),
     reconcileHotRestartAdoption: vi.fn(async () => ({ mode: "none" })),
+    prepareHotRestartShutdown: vi.fn(async () => ({ skipDrain: false })),
+    drainRunningRunsForShutdown: vi.fn(async () => ({ drained: 0 })),
+    drainActiveRunExecutions: vi.fn(async () => undefined),
     reapOrphanedRuns: vi.fn(async () => ({ reaped: 0, runIds: [] })),
     promoteDueScheduledRetries: vi.fn(async () => ({ promoted: 0, runIds: [] })),
     resumeQueuedRuns: vi.fn(async () => undefined),
@@ -593,6 +596,137 @@ describe("startServer feedback export wiring", () => {
       expect(reconcileSafeNativeReplacements).toHaveBeenCalledTimes(2);
     } finally {
       setIntervalSpy.mockRestore();
+    }
+  });
+
+  it("coalesces periodic recovery ticks until the full chain settles without blocking independent sweeps", async () => {
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
+    loadConfigMock.mockReturnValue(buildTestConfig({ heartbeatSchedulerEnabled: true }));
+    let finishRecovery!: () => void;
+    const recovery = new Promise<void>((resolve) => { finishRecovery = resolve; });
+    let started: Awaited<ReturnType<typeof startServer>> | undefined;
+    try {
+      started = await startServer();
+      vi.clearAllMocks();
+      // Hold the middle of the actual index.ts chain, after its reaper finished.
+      heartbeatServiceMock.resumeQueuedRuns.mockImplementationOnce(() => recovery);
+
+      await vi.advanceTimersByTimeAsync(90_000);
+
+      expect(heartbeatServiceMock.reapOrphanedRuns).toHaveBeenCalledTimes(1);
+      expect(heartbeatServiceMock.resumeQueuedRuns).toHaveBeenCalledTimes(1);
+      expect(heartbeatServiceMock.sweepStaleIssueLocks).not.toHaveBeenCalled();
+      expect(heartbeatServiceMock.tickTimers).toHaveBeenCalledTimes(3);
+      expect(routineServiceMock.tickScheduledTriggers).toHaveBeenCalledTimes(3);
+      expect(environmentCustomImagesServiceMock.cleanupExpiredSetupSessions).toHaveBeenCalledTimes(3);
+      expect(reconcileSafeNativeReplacements).toHaveBeenCalled();
+
+      finishRecovery();
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(heartbeatServiceMock.sweepStaleIssueLocks).toHaveBeenCalledTimes(1);
+
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(heartbeatServiceMock.reapOrphanedRuns).toHaveBeenCalledTimes(2);
+      expect(heartbeatServiceMock.resumeQueuedRuns).toHaveBeenCalledTimes(2);
+      expect(heartbeatServiceMock.sweepStaleIssueLocks).toHaveBeenCalledTimes(2);
+    } finally {
+      finishRecovery();
+      await started?.shutdown();
+      vi.useRealTimers();
+    }
+  });
+
+  it.each(["reaper", "queue"] as const)("permits the next periodic recovery after a %s failure", async (failurePoint) => {
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
+    loadConfigMock.mockReturnValue(buildTestConfig({ heartbeatSchedulerEnabled: true }));
+    let started: Awaited<ReturnType<typeof startServer>> | undefined;
+    try {
+      started = await startServer();
+      vi.clearAllMocks();
+      const failure = new Error("periodic recovery unavailable");
+      if (failurePoint === "reaper") {
+        heartbeatServiceMock.reapOrphanedRuns.mockImplementationOnce(() => { throw failure; });
+      } else {
+        heartbeatServiceMock.resumeQueuedRuns.mockRejectedValueOnce(failure);
+      }
+
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(heartbeatServiceMock.reapOrphanedRuns).toHaveBeenCalledTimes(1);
+      expect(heartbeatServiceMock.sweepStaleIssueLocks).not.toHaveBeenCalled();
+
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(heartbeatServiceMock.reapOrphanedRuns).toHaveBeenCalledTimes(2);
+      expect(heartbeatServiceMock.sweepStaleIssueLocks).toHaveBeenCalledTimes(1);
+    } finally {
+      await started?.shutdown();
+      vi.useRealTimers();
+    }
+  });
+
+  it("waits for the coalesced recovery chain during shutdown and admits no later ticks", async () => {
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
+    loadConfigMock.mockReturnValue(buildTestConfig({ heartbeatSchedulerEnabled: true }));
+    let finishRecovery!: () => void;
+    const recovery = new Promise<void>((resolve) => { finishRecovery = resolve; });
+    let started: Awaited<ReturnType<typeof startServer>> | undefined;
+    let stopping: Promise<void> | undefined;
+    try {
+      started = await startServer();
+      vi.clearAllMocks();
+      heartbeatServiceMock.resumeQueuedRuns.mockImplementationOnce(() => recovery);
+      await vi.advanceTimersByTimeAsync(60_000);
+
+      let stopped = false;
+      stopping = started.shutdown().then(() => { stopped = true; });
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(stopped).toBe(false);
+      expect(heartbeatServiceMock.prepareHotRestartShutdown).not.toHaveBeenCalled();
+      expect(heartbeatServiceMock.drainRunningRunsForShutdown).not.toHaveBeenCalled();
+
+      await vi.advanceTimersByTimeAsync(90_000);
+      expect(heartbeatServiceMock.reapOrphanedRuns).toHaveBeenCalledTimes(1);
+      expect(heartbeatServiceMock.resumeQueuedRuns).toHaveBeenCalledTimes(1);
+      finishRecovery();
+      await stopping;
+      expect(stopped).toBe(true);
+      expect(heartbeatServiceMock.sweepStaleIssueLocks).toHaveBeenCalledTimes(1);
+      expect(heartbeatServiceMock.prepareHotRestartShutdown).toHaveBeenCalledTimes(1);
+      expect(heartbeatServiceMock.drainRunningRunsForShutdown).toHaveBeenCalledTimes(1);
+    } finally {
+      finishRecovery();
+      await (stopping ?? started?.shutdown());
+      vi.useRealTimers();
+    }
+  });
+
+  it("finishes startup recovery before registering recurring heartbeat ticks", async () => {
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
+    loadConfigMock.mockReturnValue(buildTestConfig({ heartbeatSchedulerEnabled: true }));
+    let finishStartup!: () => void;
+    const startupRecovery = new Promise<{ reaped: number; runIds: string[] }>((resolve) => {
+      finishStartup = () => resolve({ reaped: 0, runIds: [] });
+    });
+    heartbeatServiceMock.reapOrphanedRuns.mockImplementationOnce(() => startupRecovery);
+    const starting = startServer();
+    let started: Awaited<ReturnType<typeof startServer>> | undefined;
+    try {
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      await vi.advanceTimersByTimeAsync(90_000);
+      expect(heartbeatServiceMock.reapOrphanedRuns).toHaveBeenCalledTimes(1);
+      expect(heartbeatServiceMock.resumeQueuedRuns).not.toHaveBeenCalled();
+      expect(heartbeatServiceMock.tickTimers).not.toHaveBeenCalled();
+
+      finishStartup();
+      started = await starting;
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(heartbeatServiceMock.reapOrphanedRuns).toHaveBeenCalledTimes(2);
+      expect(heartbeatServiceMock.resumeQueuedRuns).toHaveBeenCalledTimes(2);
+      expect(heartbeatServiceMock.tickTimers).toHaveBeenCalledTimes(1);
+    } finally {
+      finishStartup();
+      started ??= await starting;
+      await started.shutdown();
+      vi.useRealTimers();
     }
   });
 
