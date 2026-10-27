@@ -4,6 +4,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { constants as fsConstants, promises as fs, type Dirent } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import type { Writable } from "node:stream";
 import { CONNECTION_INTENT_AGENT_GUIDANCE } from "@paperclipai/shared";
 import { sanitizeRemoteExecutionEnv } from "./remote-execution-env.js";
 import {
@@ -4675,8 +4676,31 @@ export async function ensureCommandResolvable(
       `Command is not executable: "${command}" (resolved: "${absolute}")`,
     );
   }
+  if (process.platform !== "win32") {
+    // Resolution still requires X_OK. Only improve the diagnostic after every
+    // executable candidate failed; a present non-executable grants no authority.
+    for (const dir of (env.PATH ?? env.Path ?? "").split(":").filter(Boolean)) {
+      const candidate = path.resolve(dir, command);
+      const exists = await fs.access(candidate, fsConstants.F_OK).then(() => true, () => false);
+      if (exists) throw new Error(`Command is not executable: "${command}" (resolved: "${candidate}")`);
+    }
+  }
   throw new Error(`Command not found in PATH: "${command}"`);
 }
+
+// The provider must not start its own stdin deadline until its process identity
+// is durably acknowledged. exec preserves the registered PID/PGID. This static
+// script never interpolates a command, argument, environment value or prompt.
+// A closed/malformed gate and stop signals fail closed; fd 3 never reaches the
+// target (including bwrap/SSH). Windows retains its existing direct-spawn path:
+// equivalent gating there requires a native suspended-process implementation.
+export const POSIX_PROVIDER_START_GATE = [
+  "trap 'exit 125' HUP INT TERM",
+  "IFS= read -r paperclip_gate <&3 || exit 125",
+  '[ "$paperclip_gate" = GO ] || exit 125',
+  "exec 3<&-",
+  'exec "$@"',
+].join("\n");
 
 export async function runChildProcess(
   runId: string,
@@ -4700,9 +4724,15 @@ export async function runChildProcess(
     localProcessSandbox?: LocalProcessSandboxOptions | null;
   },
 ): Promise<RunProcessResult> {
-  const onLogError =
+  const logErrorObserver =
     opts.onLogError ??
     ((err, id, msg) => console.warn({ err, runId: id }, msg));
+  const onLogError = (err: unknown, id: string, message: string) => {
+    // Diagnostics cannot control ownership or stop/reap. Also consume a
+    // rejected thenable from an observer supplied as an async void callback.
+    try { void Promise.resolve(logErrorObserver(err, id, message)).catch(() => {}); }
+    catch { /* Best-effort observer; never strand the owned child. */ }
+  };
   return new Promise<RunProcessResult>((resolve, reject) => {
     const rawMerged: NodeJS.ProcessEnv = {
       ...sanitizeInheritedPaperclipEnv(process.env),
@@ -4733,39 +4763,58 @@ export async function runChildProcess(
       remoteEnv: opts.remoteExecution ? opts.env : null,
       localProcessSandbox: opts.localProcessSandbox ?? null,
     })
-      .then((target) => {
+      .then(async (target) => {
         const childEnv = { ...mergedEnv, ...target.env };
         for (const [key, value] of Object.entries(childEnv)) {
           if (value === undefined) delete childEnv[key];
         }
-        const child = spawn(target.command, target.args, {
-          cwd: target.cwd ?? opts.cwd,
-          env: childEnv,
-          detached: process.platform !== "win32",
-          shell: false,
-          stdio: [opts.stdin != null ? "pipe" : "ignore", "pipe", "pipe"],
-        }) as ChildProcessWithEvents;
+        const gated = process.platform !== "win32" && opts.stdin != null && !!opts.onSpawn;
+        let cleanupPromise: Promise<void> | null = null;
+        const cleanupOnce = () => cleanupPromise ??= Promise.resolve().then(() => target.cleanup?.());
+        // Avoid turning a missing/non-executable command into the trampoline's
+        // shell exit 126/127. A post-check exec race still reports that shell
+        // status and stderr, rather than fabricating a successful provider start.
+        if (gated) {
+          try {
+            await ensureCommandResolvable(target.command, target.cwd ?? opts.cwd, childEnv);
+          } catch (err) {
+            await cleanupOnce();
+            throw err;
+          }
+        }
+        let child: ChildProcessWithEvents;
+        try {
+          child = spawn(
+            gated ? "/bin/sh" : target.command,
+            gated ? ["-c", POSIX_PROVIDER_START_GATE, "paperclip-provider-gate", target.command, ...target.args] : target.args,
+            {
+              cwd: target.cwd ?? opts.cwd,
+              env: childEnv,
+              detached: process.platform !== "win32",
+              shell: false,
+              stdio: gated
+                ? ["pipe", "pipe", "pipe", "pipe"]
+                : [opts.stdin != null ? "pipe" : "ignore", "pipe", "pipe"],
+            },
+          ) as ChildProcessWithEvents;
+        } catch (err) {
+          await cleanupOnce();
+          throw err;
+        }
         const startedAt = new Date().toISOString();
         const processGroupId = resolveProcessGroupId(child);
-
-        const spawnPersistPromise =
-          typeof child.pid === "number" && child.pid > 0 && opts.onSpawn
-            ? opts
-                .onSpawn({ pid: child.pid, processGroupId, startedAt })
-                .catch((err) => {
-                  onLogError(
-                    err,
-                    runId,
-                    "failed to record child process metadata",
-                  );
-                })
-            : Promise.resolve();
-
-        runningProcesses.set(runId, {
-          child,
-          graceSec: opts.graceSec,
-          processGroupId,
-        });
+        const gate = gated ? child.stdio[3] as Writable : null;
+        let launchClosed = false;
+        let childExited = false;
+        let settled = false;
+        let failure: Error | null = null;
+        let timeoutKillTimer: NodeJS.Timeout | null = null;
+        const closeGate = () => {
+          launchClosed = true;
+          gate?.destroy();
+        };
+        const running = { child, graceSec: opts.graceSec, processGroupId };
+        runningProcesses.set(runId, running);
 
         let timedOut = false;
         let stdout = "";
@@ -4789,7 +4838,7 @@ export async function runChildProcess(
 
         const maybeArmTerminalResultCleanup = () => {
           const terminalCleanup = opts.terminalResultCleanup;
-          if (!terminalCleanup || terminalCleanupStarted || timedOut) return;
+          if (!terminalCleanup || terminalCleanupStarted || timedOut || settled) return;
           if (!terminalResultSeen) {
             const stdoutStart = Math.max(
               0,
@@ -4829,7 +4878,7 @@ export async function runChildProcess(
           const graceMs = Math.max(0, terminalCleanup.graceMs ?? 5_000);
           terminalCleanupTimer = setTimeout(() => {
             terminalCleanupTimer = null;
-            if (terminalCleanupStarted || timedOut) return;
+            if (terminalCleanupStarted || timedOut || settled) return;
             terminalCleanupStarted = true;
             terminalCleanupSignal = "SIGTERM";
             signalRunningProcess({ child, processGroupId }, "SIGTERM");
@@ -4849,10 +4898,12 @@ export async function runChildProcess(
           opts.timeoutSec > 0
             ? setTimeout(() => {
                 timedOut = true;
+                closeGate();
                 clearTerminalCleanupTimers();
                 signalRunningProcess({ child, processGroupId }, "SIGTERM");
-                setTimeout(
+                timeoutKillTimer = setTimeout(
                   () => {
+                    timeoutKillTimer = null;
                     signalRunningProcess({ child, processGroupId }, "SIGKILL");
                   },
                   Math.max(1, opts.graceSec) * 1000,
@@ -4897,66 +4948,112 @@ export async function runChildProcess(
         });
 
         const stdin = child.stdin;
-        if (opts.stdin != null && stdin) {
-          void spawnPersistPromise.finally(() => {
-            if (child.killed || stdin.destroyed) return;
-            stdin.write(opts.stdin as string);
-            stdin.end();
-          });
-        }
+        const failLaunch = (err: Error) => {
+          // The observed child exit/stop owns the outcome, even while log flush
+          // or target cleanup is pending. A late metadata rejection must not
+          // rewrite an established cancellation/timeout. It is still logged at
+          // the callback boundary below and can never reopen the closed gate.
+          if (childExited || settled) return;
+          failure ??= err;
+          closeGate();
+          stdin?.destroy();
+          signalRunningProcess(running, "SIGKILL");
+        };
+        // Providers may exit before a large pending prompt flushes. Consume
+        // EPIPE/closed-stream errors rather than letting them escape uncaught.
+        stdin?.on("error", (err: NodeJS.ErrnoException) => {
+          if (err.code !== "EPIPE" && err.code !== "ERR_STREAM_DESTROYED") {
+            onLogError(err, runId, "failed to send child process stdin");
+          }
+        });
+        gate?.on("error", (err: Error) => {
+          onLogError(err, runId, "provider launch gate error");
+          failLaunch(new Error("Provider launch gate closed before acknowledgement", { cause: err }));
+        });
 
         child.on("error", (err: Error) => {
-          if (timeout) clearTimeout(timeout);
-          clearTerminalCleanupTimers();
-          runningProcesses.delete(runId);
-          void target.cleanup?.();
+          closeGate();
           const errno = (err as NodeJS.ErrnoException).code;
           const pathValue = mergedEnv.PATH ?? mergedEnv.Path ?? "";
-          const msg =
-            errno === "ENOENT"
-              ? `Failed to start command "${command}" in "${opts.cwd}". Verify adapter command, working directory, and PATH (${pathValue}).`
-              : `Failed to start command "${command}" in "${opts.cwd}": ${err.message}`;
-          reject(new Error(msg));
+          const msg = errno === "ENOENT"
+            ? `Failed to start command "${command}" in "${opts.cwd}". Verify adapter command, working directory, and PATH (${pathValue}).`
+            : `Failed to start command "${command}" in "${opts.cwd}": ${err.message}`;
+          failure ??= new Error(msg, { cause: err });
+          // Node emits close after spawn error too; settle there so cleanup is
+          // awaited exactly once and the owned child/handles have been reaped.
         });
 
         child.on("exit", () => {
+          childExited = true;
+          closeGate();
           maybeArmTerminalResultCleanup();
         });
 
-        child.on(
-          "close",
-          (code: number | null, signal: NodeJS.Signals | null) => {
-            if (timeout) clearTimeout(timeout);
-            clearTerminalCleanupTimers();
-            runningProcesses.delete(runId);
-            void logChain.finally(() => {
-              void Promise.resolve()
-                .then(() => target.cleanup?.())
-                .finally(() => {
-                  resolve({
-                    exitCode: code,
-                    signal,
-                    timedOut,
-                    stdout,
-                    stderr,
-                    pid: child.pid ?? null,
-                    startedAt,
-                    terminalResultCleanup: terminalCleanupStarted
-                      ? {
-                          kind: "terminal_result_cleanup",
-                          stopped: true,
-                          stopReason: UNMANAGED_BACKGROUND_TASK_STOP_REASON,
-                          reason: UNMANAGED_BACKGROUND_TASK_LIVENESS_REASON,
-                          terminalResultSeen,
-                          signal: terminalCleanupSignal,
-                          forceKilled: terminalCleanupForceKilled,
-                        }
-                      : null,
-                  });
-                });
+        child.on("close", (code: number | null, signal: NodeJS.Signals | null) => {
+          if (settled) return;
+          settled = true;
+          childExited = true;
+          closeGate();
+          if (timeout) clearTimeout(timeout);
+          if (timeoutKillTimer) clearTimeout(timeoutKillTimer);
+          clearTerminalCleanupTimers();
+          stdin?.destroy();
+          if (runningProcesses.get(runId) === running) runningProcesses.delete(runId);
+          void logChain.then(cleanupOnce).then(() => {
+            if (failure) { reject(failure); return; }
+            resolve({
+              exitCode: code, signal, timedOut, stdout, stderr,
+              pid: child.pid ?? null, startedAt,
+              terminalResultCleanup: terminalCleanupStarted ? {
+                kind: "terminal_result_cleanup", stopped: true,
+                stopReason: UNMANAGED_BACKGROUND_TASK_STOP_REASON,
+                reason: UNMANAGED_BACKGROUND_TASK_LIVENESS_REASON,
+                terminalResultSeen, signal: terminalCleanupSignal,
+                forceKilled: terminalCleanupForceKilled,
+              } : null,
             });
-          },
-        );
+          }, reject);
+        });
+
+        // Install registration, stop/close handlers and the total execution
+        // deadline before invoking persistence (which can throw synchronously).
+        const spawnPersistPromise = Promise.resolve().then(() => {
+          if (typeof child.pid === "number" && child.pid > 0) {
+            return opts.onSpawn?.({ pid: child.pid, processGroupId, startedAt });
+          }
+        });
+        void spawnPersistPromise.then(() => {
+          if (launchClosed || childExited || child.killed || timedOut) return;
+          if (runningProcesses.get(runId) !== running) {
+            if (gated) failLaunch(new Error("Provider process ownership changed before launch"));
+            return;
+          }
+          if (gated && (!stdin || stdin.destroyed || stdin.writableEnded)) {
+            failLaunch(new Error("Provider stdin was closed before launch"));
+            return;
+          }
+          if (stdin?.destroyed) return;
+          try {
+            // Queue the entire prompt and EOF first. Waiting for the write
+            // callback/drain would deadlock while a large prompt fills fd 0
+            // and the trampoline is still waiting on fd 3.
+            if (opts.stdin != null && stdin) stdin.end(opts.stdin);
+            if (gate) gate.end("GO\n");
+          } catch (err) {
+            if (gated) failLaunch(new Error("Failed to open provider launch gate", { cause: err }));
+            else onLogError(err, runId, "failed to send child process stdin");
+          }
+        }, (err: unknown) => {
+          onLogError(err, runId, "failed to record child process metadata");
+          if (gated) {
+            failLaunch(new Error("Failed to record child process metadata; provider was not launched", { cause: err }));
+          } else {
+            // Explicitly retain legacy direct-spawn behavior on Windows and
+            // calls without a gated prompt; no portable shell fallback.
+            if (!childExited && !child.killed && !stdin?.destroyed && opts.stdin != null) stdin?.end(opts.stdin);
+          }
+        });
+
       })
       .catch(reject);
   });
